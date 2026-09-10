@@ -134,9 +134,10 @@ async def daily_loop(seg_dir, daily_dir, retention_days):
     mp4 per camera and prune old daily files. Fully in-process, no cron."""
     while True:
         now = datetime.now(TZ)
-        nxt = (now + timedelta(days=1)).replace(hour=0, minute=10, second=0,
-                                                microsecond=0)
-        await asyncio.sleep(max(60, (nxt - now).total_seconds()))
+        nxt = now.replace(hour=0, minute=10, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        await asyncio.sleep((nxt - now).total_seconds())
         yesterday = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y%m%d")
         try:
             concat_day(seg_dir, daily_dir, yesterday)
