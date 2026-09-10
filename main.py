@@ -103,12 +103,14 @@ async def run_camera(sig, cam, ice_cfg, opts):
                         ts = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
                         img.save(os.path.join(path, f"{ts}.png"))
         except asyncio.CancelledError:
+            if recorder:
+                recorder.close()
             raise
         except Exception as ex:
             log.warning("[%s] session dropped (%s), retrying in 10s", name, ex)
         finally:
-            if recorder:
-                recorder.close()
+            # keep the recorder's ffmpeg alive across reconnects so a flaky
+            # camera produces one continuous segment, not a pile of stubs.
             await stream.close()
         await asyncio.sleep(10)
 
