@@ -133,10 +133,16 @@ host user.
 
 * **`now.png`** in each camera's snapshot path — for Home Assistant's
   `local_file` camera. Refreshed every `SNAPSHOT_INTERVAL` seconds.
-* **Segmented mp4 recordings** under `RECORD_DIR/<name>/`, filenames
-  `YYYYMMDD-HHMMSS.mp4`, one new file every `SEGMENT_SECONDS`. Files older than
-  `RETENTION_DAYS` are pruned hourly.
-* **RTSP re-publish** to `RTSP_BASE/<name>` if `RTSP_BASE` is set.
+* **Rolling segments** under `RECORD_DIR/<name>/`, filenames
+  `YYYYMMDD-HHMMSS.mp4`, a new file every `SEGMENT_SECONDS`. Fragmented mp4, so
+  the in-progress file stays playable. Pruned after `RETENTION_DAYS`.
+* **One file per camera per day** under `DAILY_DIR/<name>/YYYYMMDD.mp4`, if
+  `DAILY_DIR` is set. Just after midnight (local TZ) the previous day's segments
+  are stitched with `ffmpeg -c copy` (no re-encode), the segments are deleted,
+  and daily files older than `DAILY_RETENTION_DAYS` are pruned. All in-process —
+  no cron.
+* **RTSP re-publish** to `RTSP_BASE/<name>` if `RTSP_BASE` is set — this is the
+  clean hook for a downstream Frigate / go2rtc setup.
 
 ### Environment variables
 
@@ -145,11 +151,13 @@ host user.
 | `AIDOT_USER` / `AIDOT_PASSWORD` | — | app.aidot.com credentials |
 | `COUNTRY_KEY` | `region:UnitedStates` | account region |
 | `CAMERAS` | every IPC | `name=<deviceId>:/path,…` (path optional) |
-| `RECORD_DIR` | — | recordings root; unset disables recording |
-| `SEGMENT_SECONDS` | `600` | mp4 segment length |
+| `RECORD_DIR` | — | segment root; unset disables recording |
+| `SEGMENT_SECONDS` | `600` | segment length |
 | `RECORD_FPS` | `12` | recording framerate (keep below the camera's real fps) |
 | `RECORD_CRF` | `26` | x264 quality (lower = bigger/better) |
-| `RETENTION_DAYS` | `3` | delete recordings older than this |
+| `RETENTION_DAYS` | `3` | prune segments older than this (safety net) |
+| `DAILY_DIR` | — | if set, consolidate into one mp4 per camera per day |
+| `DAILY_RETENTION_DAYS` | `15` | prune daily files older than this |
 | `SNAPSHOT_INTERVAL` | `5` | seconds between `now.png` refreshes (`0` = off) |
 | `SNAPSHOT_KEEP` | `0` | `1` also writes timestamped `<ts>.png` files |
 | `RTSP_BASE` | — | if set, re-publishes to `<base>/<name>` |
@@ -157,12 +165,12 @@ host user.
 
 ### Building a timelapse
 
-Speed up a day of recordings with ffmpeg:
+Speed up a day of recordings with ffmpeg (works off the daily file or the raw
+segments):
 
 ```bash
 DAY=20260910; CAM=cam0
-ls /mnt/hdd/aidot/$CAM/$DAY-*.mp4 | sed "s/^/file '/;s/$/'/" > /tmp/list.txt
-ffmpeg -f concat -safe 0 -i /tmp/list.txt -an \
+ffmpeg -i /mnt/hdd/aidot-daily/$CAM/$DAY.mp4 -an \
   -vf "setpts=PTS/60,fps=30" -c:v libx264 -crf 23 $CAM-$DAY-timelapse.mp4
 ```
 

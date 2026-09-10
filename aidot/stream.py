@@ -230,3 +230,48 @@ def prune_old(root, retention_days):
             except OSError:
                 pass
     return removed
+
+
+def concat_day(seg_dir, daily_dir, day):
+    """Stitch one day's segments into daily_dir/<cam>/<day>.mp4 per camera.
+
+    `day` is a YYYYMMDD string; segments are `<day>-*.mp4`. Uses ffmpeg's
+    concat demuxer with stream copy (no re-encode), so it is fast and lossless,
+    and writes +faststart for quick seeking. Consolidated segments are deleted.
+    Returns a dict {camera: bytes_written} for the files it produced.
+    """
+    out = {}
+    for cam in sorted(os.listdir(seg_dir)):
+        camdir = os.path.join(seg_dir, cam)
+        if not os.path.isdir(camdir):
+            continue
+        segs = sorted(
+            f for f in os.listdir(camdir)
+            if f.startswith(f"{day}-") and f.endswith(".mp4")
+            and os.path.getsize(os.path.join(camdir, f)) > 4096  # skip empty stubs
+        )
+        if not segs:
+            continue
+
+        os.makedirs(os.path.join(daily_dir, cam), exist_ok=True)
+        listfile = os.path.join(camdir, f".concat-{day}.txt")
+        with open(listfile, "w") as fh:
+            for s in segs:
+                fh.write(f"file '{os.path.join(camdir, s)}'\n")
+
+        dst = os.path.join(daily_dir, cam, f"{day}.mp4")
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+               "-f", "concat", "-safe", "0", "-i", listfile,
+               "-c", "copy", "-movflags", "+faststart", dst]
+        rc = subprocess.run(cmd).returncode
+        os.remove(listfile)
+        if rc == 0:
+            for s in segs:
+                os.remove(os.path.join(camdir, s))
+            out[cam] = os.path.getsize(dst)
+            log.info("[%s] consolidated %s (%d segments -> %.1f MB)",
+                     cam, day, len(segs), out[cam] / 1e6)
+        else:
+            log.warning("[%s] concat of %s failed (rc=%d), segments kept",
+                        cam, day, rc)
+    return out

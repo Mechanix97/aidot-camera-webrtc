@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aidot.api import AidotAPI
 from aidot.signaling import Signaling
-from aidot.stream import CameraStream, FfmpegSink, SegmentRecorder, prune_old
+from aidot.stream import (CameraStream, FfmpegSink, SegmentRecorder, concat_day,
+                          prune_old)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -116,16 +117,35 @@ async def run_camera(sig, cam, ice_cfg, opts):
 
 
 async def retention_loop(record_dir, retention_days):
-    """Prune files older than the retention window, hourly."""
+    """Prune segment files older than the retention window, hourly."""
     while True:
         try:
             n = prune_old(record_dir, retention_days)
             if n:
-                log.info("retention: removed %d files older than %dd in %s",
+                log.info("retention: removed %d segment files older than %dd in %s",
                          n, retention_days, record_dir)
         except Exception as ex:
             log.warning("retention pass failed: %s", ex)
         await asyncio.sleep(3600)
+
+
+async def daily_loop(seg_dir, daily_dir, retention_days):
+    """Just after midnight (local TZ), stitch yesterday's segments into one
+    mp4 per camera and prune old daily files. Fully in-process, no cron."""
+    while True:
+        now = datetime.now(TZ)
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=10, second=0,
+                                                microsecond=0)
+        await asyncio.sleep(max(60, (nxt - now).total_seconds()))
+        yesterday = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y%m%d")
+        try:
+            concat_day(seg_dir, daily_dir, yesterday)
+            n = prune_old(daily_dir, retention_days)
+            if n:
+                log.info("daily retention: removed %d files older than %dd",
+                         n, retention_days)
+        except Exception as ex:
+            log.warning("daily consolidation failed: %s", ex)
 
 
 async def main():
@@ -141,7 +161,9 @@ async def main():
         "record_fps": int(env("RECORD_FPS", "12")),
         "record_crf": int(env("RECORD_CRF", "26")),
     }
-    retention_days = int(env("RETENTION_DAYS", "3"))
+    retention_days = int(env("RETENTION_DAYS", "3"))          # segment retention
+    daily_dir = env("DAILY_DIR")                             # set -> nightly one-file-per-day
+    daily_retention_days = int(env("DAILY_RETENTION_DAYS", "15"))
     cams = parse_cameras()
 
     api = AidotAPI(user, pwd, country_key=env("COUNTRY_KEY", "region:UnitedStates"))
@@ -167,6 +189,9 @@ async def main():
     if opts["record_dir"]:
         tasks.append(asyncio.ensure_future(
             retention_loop(opts["record_dir"], retention_days)))
+        if daily_dir:
+            tasks.append(asyncio.ensure_future(
+                daily_loop(opts["record_dir"], daily_dir, daily_retention_days)))
     try:
         await asyncio.gather(*tasks)
     finally:

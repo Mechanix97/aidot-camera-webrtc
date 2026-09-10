@@ -3,8 +3,7 @@ services:
     build: .
     image: aidot-webrtc:latest
     container_name: aidot-webrtc
-    # Run as lucas (uid 1000): recordings/snapshots stay owned by the host user
-    # so timelapse.py (cron, uid 1000) can read and clean them.
+    # Run as lucas (uid 1000): recordings/snapshots stay owned by the host user.
     user: "1000:1000"
     # host networking: the local ICE candidates must be the real LAN ones,
     # otherwise the media falls back to TURN (or fails to connect).
@@ -14,6 +13,8 @@ services:
     volumes:
       # now.png for Home Assistant's local_file camera
       - /home/lucas/home-assistant/data:/data
-      # continuous recordings — on the big NTFS disk, not the 100 GB root fs
+      # rolling 10-min segments (RECORD_DIR=/rec), pruned after RETENTION_DAYS
       - /mnt/hdd/aidot:/rec
+      # one consolidated mp4 per camera per day (DAILY_DIR=/daily)
+      - /mnt/hdd/aidot-daily:/daily
     restart: unless-stopped
