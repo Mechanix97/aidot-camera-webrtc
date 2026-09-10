@@ -207,6 +207,10 @@ class SegmentRecorder(_FfmpegPipe):
                 "-pix_fmt", "yuv420p", "-g", str(self.fps * 2),
                 "-f", "segment", "-segment_time", str(self.segment_seconds),
                 "-segment_format", "mp4", "-reset_timestamps", "1", "-strftime", "1",
+                # fragmented mp4: each segment stays playable while it is still
+                # being written and survives an abrupt process kill (no trailing
+                # moov atom needed).
+                "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof",
                 pattern]
 
 
