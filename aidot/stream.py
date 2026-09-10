@@ -1,11 +1,18 @@
-"""Recibe el track H.264 de una cámara aiDot por WebRTC y lo saca por ffmpeg.
+"""Receive a camera's H.264 track over WebRTC and fan it out to sinks.
 
-La cámara ofrece un candidato ICE `typ host` con su IP de LAN, asi que el media
-viaja directo por la red local: la nube solo interviene en el handshake.
+The camera advertises an ICE candidate of type `host` with its LAN IP, so the
+media flows peer-to-peer over the local network: the cloud only brokers the
+handshake. From the decoded frames we can:
+
+  * write `now.png` snapshots (for Home Assistant's local_file camera)
+  * record segmented mp4 files (continuous DVR)
+  * re-publish to RTSP (for go2rtc / Frigate / Home Assistant)
 """
 import asyncio
 import logging
+import os
 import subprocess
+import time
 
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.sdp import candidate_from_sdp
@@ -14,7 +21,7 @@ log = logging.getLogger("aidot.stream")
 
 
 def ice_servers_from_config(ice_cfg, device_id=None):
-    """Convierte la respuesta de /api/webrtc/iceConfig en RTCIceServer."""
+    """Turn the /api/webrtc/iceConfig response into a list of RTCIceServer."""
     servers = []
     entries = list(ice_cfg.get("app") or [])
     for d in ice_cfg.get("dev") or []:
@@ -22,7 +29,7 @@ def ice_servers_from_config(ice_cfg, device_id=None):
             entries.append(d)
     for e in entries:
         uris = e.get("dnsUris") or e.get("uris") or []
-        # aiortc rechaza URIs stun: con ?transport= (RFC 7064). turn: si lo admite.
+        # aiortc rejects stun: URIs that carry ?transport= (RFC 7064). turn: is fine.
         stun = [u.split("?", 1)[0] for u in uris if u.startswith("stun:")]
         turn = [u for u in uris if u.startswith("turn:")]
         if stun:
@@ -35,10 +42,11 @@ def ice_servers_from_config(ice_cfg, device_id=None):
 
 
 def ice_server_list_for_device(ice_cfg, device_id):
-    """El IceServerList que la cámara espera dentro del webrtcReq (formato arnoo).
+    """Build the `IceServerList` the camera expects inside the webrtcReq (arnoo shape).
 
-    El webapp manda una sola entrada: la del `dev` que matchea el deviceId
-    (Username=deviceId, Password=token). Fallback al primer `app`.
+    The webapp sends a single entry: the `dev` entry matching the deviceId
+    (Username=deviceId, Password=token). Falls back to the first `app` entry.
+    Without this field the camera never answers the offer.
     """
     for e in ice_cfg.get("dev") or []:
         if e.get("id") == device_id:
@@ -58,7 +66,7 @@ def ice_server_list_for_device(ice_cfg, device_id):
 
 
 class CameraStream:
-    """Negocia una sesion y expone el track de video."""
+    """Negotiates one WebRTC session and exposes the incoming video track."""
 
     def __init__(self, sig, device_id, ice_cfg, name=None):
         self.sig = sig
@@ -78,22 +86,23 @@ class CameraStream:
 
         @self.pc.on("track")
         def on_track(track):
-            log.info("[%s] track recibido: %s", self.name, track.kind)
+            log.info("[%s] track received: %s", self.name, track.kind)
             if track.kind == "video":
                 self.track = track
                 self._track_ready.set()
 
         @self.pc.on("connectionstatechange")
         async def on_state():
-            log.info("[%s] estado: %s", self.name, self.pc.connectionState)
+            log.info("[%s] connection state: %s", self.name, self.pc.connectionState)
 
-        # solo queremos recibir
+        # video only, receive-only. Requesting audio too makes some cameras
+        # answer with mismatched m-lines ("Media sections in answer do not
+        # match offer"); we don't use the audio track anyway.
         self.pc.addTransceiver("video", direction="recvonly")
-        self.pc.addTransceiver("audio", direction="recvonly")
 
         offer = await self.pc.createOffer()
         await self.pc.setLocalDescription(offer)
-        # aiortc no hace trickle: el localDescription ya trae los candidatos
+        # aiortc does not trickle: localDescription already carries the candidates
         self.sig.send_offer(self.device_id, peerid, self.pc.localDescription.sdp,
                             ice_server_list=ice_server_list_for_device(self.ice_cfg,
                                                                        self.device_id))
@@ -101,9 +110,9 @@ class CameraStream:
         answer_sdp = await self.sig.wait_answer(peerid, timeout=timeout)
         await self.pc.setRemoteDescription(
             RTCSessionDescription(sdp=answer_sdp, type="answer"))
-        log.info("[%s] answer aplicada", self.name)
+        log.info("[%s] answer applied", self.name)
 
-        # candidatos remotos que lleguen despues
+        # remote candidates that arrive afterwards
         async def pump():
             async for cand in self.sig.candidates(peerid):
                 try:
@@ -112,7 +121,7 @@ class CameraStream:
                     c.sdpMLineIndex = 0
                     await self.pc.addIceCandidate(c)
                 except Exception as ex:
-                    log.debug("[%s] candidato ignorado: %s", self.name, ex)
+                    log.debug("[%s] candidate ignored: %s", self.name, ex)
         self._pump = asyncio.ensure_future(pump())
 
         await asyncio.wait_for(self._track_ready.wait(), timeout=timeout)
@@ -125,47 +134,95 @@ class CameraStream:
             await self.pc.close()
 
 
-class FfmpegSink:
-    """Toma VideoFrames de aiortc y los reencodea a RTSP (o snapshots)."""
+class _FfmpegPipe:
+    """Base: feed decoded yuv420p frames into an ffmpeg process over stdin."""
 
-    def __init__(self, name, rtsp_url=None, snapshot_dir=None,
-                 snapshot_every=5.0, fps=15, size=None):
+    def __init__(self, name, fps):
         self.name = name
-        self.rtsp_url = rtsp_url
-        self.snapshot_dir = snapshot_dir
-        self.snapshot_every = snapshot_every
         self.fps = fps
-        self.size = size
         self.proc = None
 
+    def _args(self, w, h):
+        raise NotImplementedError
+
     def _start(self, w, h):
-        if not self.rtsp_url:
-            return
-        cmd = [
-            "ffmpeg", "-loglevel", "warning",
-            "-f", "rawvideo", "-pix_fmt", "yuv420p",
-            "-s", f"{w}x{h}", "-r", str(self.fps), "-i", "-",
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-g", str(self.fps * 2), "-pix_fmt", "yuv420p",
-            "-f", "rtsp", "-rtsp_transport", "tcp", self.rtsp_url,
-        ]
-        log.info("[%s] ffmpeg -> %s (%dx%d)", self.name, self.rtsp_url, w, h)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+               "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+               "-r", str(self.fps), "-i", "-"] + self._args(w, h)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def write(self, frame):
-        if self.proc is None:
+        if self.proc is None or self.proc.poll() is not None:
             self._start(frame.width, frame.height)
-        if self.proc and self.proc.stdin:
-            try:
-                self.proc.stdin.write(frame.to_ndarray(format="yuv420p").tobytes())
-            except BrokenPipeError:
-                log.warning("[%s] ffmpeg murio", self.name)
-                self.proc = None
+        try:
+            self.proc.stdin.write(frame.to_ndarray(format="yuv420p").tobytes())
+        except (BrokenPipeError, ValueError, AttributeError):
+            log.warning("[%s] ffmpeg died, restarting on next frame", self.name)
+            self.proc = None
 
     def close(self):
         if self.proc and self.proc.stdin:
             try:
                 self.proc.stdin.close()
-                self.proc.wait(timeout=5)
+                self.proc.wait(timeout=10)
             except Exception:
                 self.proc.kill()
+
+
+class FfmpegSink(_FfmpegPipe):
+    """Re-encode the frames and push them to an RTSP endpoint."""
+
+    def __init__(self, name, rtsp_url, fps=15):
+        super().__init__(name, fps)
+        self.rtsp_url = rtsp_url
+
+    def _args(self, w, h):
+        log.info("[%s] rtsp -> %s (%dx%d)", self.name, self.rtsp_url, w, h)
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-g", str(self.fps * 2), "-pix_fmt", "yuv420p",
+                "-f", "rtsp", "-rtsp_transport", "tcp", self.rtsp_url]
+
+
+class SegmentRecorder(_FfmpegPipe):
+    """Record the track to segmented mp4 files (one folder per camera).
+
+    ffmpeg re-encodes the decoded rawvideo to H.264 and cuts a new file every
+    `segment_seconds`. Filenames are `%Y%m%d-%H%M%S.mp4` in the container's
+    local time. The caller paces writes to `fps` so the file duration matches
+    wall-clock time even when the camera's framerate drifts.
+    """
+
+    def __init__(self, name, out_dir, segment_seconds=600, fps=12, crf=26):
+        super().__init__(name, fps)
+        self.out_dir = out_dir
+        self.segment_seconds = segment_seconds
+        self.crf = crf
+        os.makedirs(out_dir, exist_ok=True)
+
+    def _args(self, w, h):
+        pattern = os.path.join(self.out_dir, "%Y%m%d-%H%M%S.mp4")
+        log.info("[%s] recording -> %s/ (%ds segments, %dfps)",
+                 self.name, self.out_dir, self.segment_seconds, self.fps)
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(self.crf),
+                "-pix_fmt", "yuv420p", "-g", str(self.fps * 2),
+                "-f", "segment", "-segment_time", str(self.segment_seconds),
+                "-segment_format", "mp4", "-reset_timestamps", "1", "-strftime", "1",
+                pattern]
+
+
+def prune_old(root, retention_days):
+    """Delete .mp4 / .png files older than `retention_days` under `root/`."""
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            if not f.endswith((".mp4", ".png")):
+                continue
+            p = os.path.join(dirpath, f)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+                    removed += 1
+            except OSError:
+                pass
+    return removed

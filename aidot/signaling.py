@@ -1,16 +1,16 @@
-"""Señalización WebRTC de cámaras aiDot sobre el broker MQTT de arnoo.
+"""WebRTC signaling for aiDot cameras over the arnoo MQTT broker.
 
-Flujo (descubierto capturando el webapp):
+Flow (reverse-engineered from the webapp):
 
-  SUB  iot/v1/c/<userId>/#            <- respuestas del servidor/dispositivo
+  SUB  iot/v1/c/<userId>/#             <- responses from the server / device
   SUB  iot/v1/cb/<deviceId>/#
-  PUB  iot/v1/cb/<userId>/user/connect       {service:user, method:connect}
-  PUB  iot/v1/s/<userId>/IPC/webrtcReq       offer  SDP
-  RCV  iot/v1/c/<userId>/IPC/webrtcResp      answer SDP
-  PUB  iot/v1/s/<userId>/IPC/iceCandidateReq candidatos locales
-  RCV  iot/v1/c/<userId>/IPC/iceCandidateReq candidatos remotos
+  PUB  iot/v1/cb/<userId>/user/connect        {service:user, method:connect}
+  PUB  iot/v1/s/<userId>/IPC/webrtcReq        offer  SDP
+  RCV  iot/v1/c/<userId>/IPC/webrtcResp       answer SDP
+  PUB  iot/v1/s/<userId>/IPC/iceCandidateReq  local candidates
+  RCV  iot/v1/c/<userId>/IPC/iceCandidateReq  remote candidates
 
-Todo JSON plano; no hay cifrado de payload.
+Everything is plain JSON; the payload is not encrypted.
 """
 import asyncio
 import json
@@ -31,7 +31,7 @@ def _peerid():
 
 
 class Signaling:
-    """Cliente MQTT que negocia sesiones WebRTC con las cámaras."""
+    """MQTT client that negotiates WebRTC sessions with the cameras."""
 
     def __init__(self, mqtt_cfg, user_id, loop=None):
         self.host, port = mqtt_cfg["host"].split(":")

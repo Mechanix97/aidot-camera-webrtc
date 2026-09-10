@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Captura la señalización WebRTC de app.aidot.com.
+"""Capture the WebRTC signaling of app.aidot.com.
 
-Usa el performance log de Selenium (CDP Network domain) para registrar TODOS los
-frames WebSocket y requests, incluyendo los que ocurren dentro de Web Workers —
-que es donde vive el cliente MQTT del player.
+Uses the Selenium performance log (CDP Network domain) to record ALL WebSocket
+frames and requests, including those inside Web Workers -- which is where the
+player's MQTT client lives.
 
-Salida: captures/signaling-<ts>.json con todo el tráfico relevante.
+Output: captures/signaling-<ts>.json with every relevant frame.
 """
-import json, os, sys, time, urllib.request
+import json, os, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(HERE)
@@ -59,7 +59,7 @@ def main():
         rq("POST", f"/session/{sid}/url", {"url": url})
 
     def drain_log():
-        """Vacía el performance log y devuelve los mensajes CDP parseados."""
+        """Drain the performance log and return the parsed CDP messages."""
         try:
             entries = rq("POST", f"/session/{sid}/se/log", {"type": "performance"})["value"]
         except Exception as ex:
@@ -98,10 +98,10 @@ def main():
         for i in range(45):
             collected += drain_log()
             if js("const v=document.querySelector('video'); return !!(v&&v.videoWidth>0);"):
-                print(f"  video OK a los {i}s")
+                print(f"  video OK after {i}s")
                 break
             time.sleep(1)
-        # dejar correr un poco mas para capturar keepalives
+        # let it run a bit longer to capture keepalives
         for _ in range(6):
             time.sleep(1)
             collected += drain_log()
@@ -113,7 +113,7 @@ def main():
         except Exception:
             pass
 
-    # --- filtrar lo interesante ---
+    # --- keep only the interesting events ---
     ws_frames, ws_created, requests_ = [], [], []
     for m in collected:
         meth = m.get("method", "")
@@ -146,13 +146,13 @@ def main():
                   f, indent=2, ensure_ascii=False)
 
     print(f"\n{'='*70}")
-    print(f"eventos CDP totales : {len(collected)}")
-    print(f"websockets creados  : {len(ws_created)}")
+    print(f"total CDP events   : {len(collected)}")
+    print(f"websockets created : {len(ws_created)}")
     for w in ws_created:
         print(f"   {w['url']}")
-    print(f"frames WS           : {len(ws_frames)}")
-    print(f"requests arnoo      : {len(requests_)}")
-    print(f"\nguardado en: {out}")
+    print(f"WS frames          : {len(ws_frames)}")
+    print(f"arnoo requests     : {len(requests_)}")
+    print(f"\nsaved to: {out}")
 
 
 if __name__ == "__main__":

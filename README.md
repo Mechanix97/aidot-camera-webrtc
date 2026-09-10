@@ -1,21 +1,21 @@
 # aidot-webrtc
 
-Trae el video de las cámaras **aiDot / Winees (Leedarson)** sin pasar por el
-navegador: se autentica contra la API de arnoo, negocia WebRTC por su broker
-MQTT y recibe el track **H.264 directo de la cámara por la LAN**.
+Pulls video from **aiDot / Winees (Leedarson)** cameras without a browser:
+authenticates against the arnoo API, negotiates WebRTC over their MQTT broker
+and receives the **H.264 track straight from the camera over the LAN**.
 
-Reemplaza el enfoque de "Selenium + screenshot cada 5s", que consumía ~1,1 GB
-de RAM y ~90% de CPU de forma constante.
+Replaces the "Selenium + screenshot every 5s" approach, which burned ~1.1 GB of
+RAM and ~90% CPU continuously.
 
-> Probado con `LK.IPC.A000088` (firmware V1.05.09) en la región US.
+> Tested with `LK.IPC.A000088` (firmware V1.05.09) in the US region.
 
 ---
 
-## Hallazgo principal
+## Key finding
 
-La cámara **no expone nada localmente** (sin RTSP, ONVIF, PPPP, ni puertos TCP
-abiertos), pero en la respuesta SDP ofrece un candidato ICE de tipo `host` con
-su IP de LAN:
+The camera **exposes nothing locally** (no RTSP, ONVIF, PPPP, no open TCP
+ports), but in the SDP answer it offers an ICE candidate of type `host` with its
+LAN IP:
 
 ```
 a=candidate:0 1 udp 2130706431 192.168.100.75 63772 typ host
@@ -23,18 +23,18 @@ a=rtpmap:102 H264/90000
 a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
 ```
 
-**El media viaja peer-to-peer por la red local.** La nube solo hace de
-intermediaria para el handshake. Video H.264, audio PCMA (G.711).
+**The media flows peer-to-peer over the local network.** The cloud only brokers
+the handshake. Video is H.264, audio is PCMA (G.711) — only video is used here.
 
 ---
 
-## Protocolo
+## Protocol
 
-### 1. Autenticación
+### 1. Authentication
 
 `POST https://prod-us-api.arnoo.com/v29/users/loginWithFreeVerification`
 
-Headers relevantes: `appId: 1383974540041977857`, `token: undefined`,
+Relevant headers: `appId: 1383974540041977857`, `token: undefined`,
 `terminal: app`, `webVersion: 0.5.5`, `locale`, `traceId`, `Referer`.
 
 ```json
@@ -42,8 +42,8 @@ Headers relevantes: `appId: 1383974540041977857`, `token: undefined`,
  "terminalId":"<random21>","webVersion":"0.5.5","area":"UTC","UTC":"UTC+0"}
 ```
 
-El password va cifrado con **RSA-1024 PKCS#1 v1.5** (estilo JSEncrypt). La clave
-pública está hardcodeada en `https://app.aidot.com/static/js/main.*.js`:
+The password is encrypted with **RSA-1024 PKCS#1 v1.5** (JSEncrypt style). The
+public key is hardcoded in `https://app.aidot.com/static/js/main.*.js`:
 
 ```
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCtQAnPCi8ksPnS1Du6z96PsKfNp2Gp/f/bHwlr
@@ -51,37 +51,37 @@ AdplbX3p7/TnGpnbJGkLq8uRxf6cw+vOthTsZjkPCF7CatRvRnTjc9fcy7yE0oXa5TloYyXD6Gkx
 gftBbN/movkJJGQCc7gFavuYoAdTRBOyQoXBtm0mkXMSjXOldI/290b9BQIDAQAB
 ```
 
-Devuelve `accessToken` y el `userId`. A partir de ahí todas las llamadas llevan
+Returns `accessToken` and `userId`. From then on every call carries
 `token: <accessToken>`.
 
-### 2. Endpoints usados
+### 2. Endpoints used
 
-| Endpoint | Para qué |
+| Endpoint | Purpose |
 |---|---|
-| `GET /v29/houses` | id de la casa |
-| `GET /v29/devices?houseId=<id>` | lista de dispositivos (`type: IPC` = cámara) |
-| `GET /v29/commons/mqttConfig?source=WebPC&sessionId=<random>` | credenciales MQTT |
-| `GET /v29/api/webrtc/iceConfig?forceRefresh=0` | STUN/TURN + token por dispositivo |
-| `POST /v29/api/ipc/thumb/latestThumb` | último thumbnail (JPEG en CloudFront) |
+| `GET /v29/houses` | house id |
+| `GET /v29/devices?houseId=<id>` | device list (`type: IPC` = camera) |
+| `GET /v29/commons/mqttConfig?source=WebPC&sessionId=<random>` | MQTT credentials |
+| `GET /v29/api/webrtc/iceConfig?forceRefresh=0` | STUN/TURN + per-device token |
+| `POST /v29/api/ipc/thumb/latestThumb` | latest thumbnail (JPEG on CloudFront) |
 
 ### 3. MQTT
 
-`wss://global-us-mqtt.arnoo.com:8443/mqtt` — MQTT 3.1.1 sobre WebSocket + TLS.
+`wss://global-us-mqtt.arnoo.com:8443/mqtt` — MQTT 3.1.1 over WebSocket + TLS.
 
-* **clientId**: el que devuelve `mqttConfig` (`<sessionId>-<userId>`)
+* **clientId**: the one `mqttConfig` returns (`<sessionId>-<userId>`)
 * **username**: `<userId>`
-* **password**: el de `mqttConfig`
+* **password**: the one from `mqttConfig`
 
-Suscripciones:
+Subscriptions:
 
 ```
-iot/v1/c/<userId>/#          <- respuestas
+iot/v1/c/<userId>/#          <- responses
 iot/v1/cb/<deviceId>/#
 ```
 
-### 4. Handshake WebRTC
+### 4. WebRTC handshake
 
-Todo el payload es **JSON plano, sin cifrar**.
+All payloads are **plain, unencrypted JSON**.
 
 ```
 PUB iot/v1/cb/<userId>/user/connect
@@ -92,6 +92,8 @@ PUB iot/v1/s/<userId>/IPC/webrtcReq
     {"method":"webrtcReq","service":"IPC","seq":"ap…","tst":<ms>,
      "srcAddr":"0.<userId>",
      "payload":{"dstAddr":"<deviceId>",
+                "IceServerList":[{"Uris":[...],"Password":"<token>",
+                                 "Ttl":<ts>,"Username":"<deviceId>"}],
                 "wPayload":{"peerid":"<random>","offer":{"type":"offer","sdp":"…"}}}}
 
 RCV iot/v1/c/<userId>/IPC/webrtcResp
@@ -105,53 +107,84 @@ PUB iot/v1/s/<userId>/IPC/iceCandidateReq
                 "wPayload":{"peerid":"…","candidate":{"candidate":"candidate:…"}}}}
 
 RCV iot/v1/c/<userId>/IPC/iceCandidateReq
-    (mismo shape, srcAddr "2.<deviceId>", trae el candidato host de la LAN)
+    (same shape, srcAddr "2.<deviceId>", carries the camera's LAN host candidate)
 ```
 
-El `peerid` correlaciona la sesión (formato observado:
-`<21 chars>_<6 digitos>_0_0_1`).
+**`IceServerList` in the `webrtcReq` is required** — without it the camera never
+sends an answer. `peerid` correlates the session (observed format:
+`<21 chars>_<6 digits>_0_0_1`).
 
 ---
 
-## Uso
+## Usage
 
 ```bash
-cp .env.example .env      # completar credenciales y deviceIds
-docker build -t aidot-webrtc .
-docker run -d --name aidot-webrtc --network host --env-file .env \
-  -v /home/lucas/home-assistant/data:/data aidot-webrtc
+cp .env.example .env      # fill in credentials and deviceIds
+docker compose up -d --build
 ```
 
-`--network host` importa: sin eso los candidatos ICE locales del contenedor no
-sirven y el media termina yendo por TURN (o directamente no conecta).
+`network_mode: host` matters: without it the container's local ICE candidates
+are useless and the media ends up going over TURN (or fails to connect).
 
-### Variables
+The container runs as uid 1000 so recordings and snapshots stay owned by the
+host user.
 
-| Var | Default | Qué hace |
+### What it produces
+
+* **`now.png`** in each camera's snapshot path — for Home Assistant's
+  `local_file` camera. Refreshed every `SNAPSHOT_INTERVAL` seconds.
+* **Segmented mp4 recordings** under `RECORD_DIR/<name>/`, filenames
+  `YYYYMMDD-HHMMSS.mp4`, one new file every `SEGMENT_SECONDS`. Files older than
+  `RETENTION_DAYS` are pruned hourly.
+* **RTSP re-publish** to `RTSP_BASE/<name>` if `RTSP_BASE` is set.
+
+### Environment variables
+
+| Var | Default | Purpose |
 |---|---|---|
-| `AIDOT_USER` / `AIDOT_PASSWORD` | — | credenciales de app.aidot.com |
-| `CAMERAS` | todas las IPC | `nombre=<deviceId>:/ruta/snapshots,…` |
-| `SNAPSHOT_INTERVAL` | `5` | segundos entre PNGs |
-| `RTSP_BASE` | — | si se define, republica a `<base>/<nombre>` |
-| `RTSP_FPS` | `15` | fps del republish |
+| `AIDOT_USER` / `AIDOT_PASSWORD` | — | app.aidot.com credentials |
+| `COUNTRY_KEY` | `region:UnitedStates` | account region |
+| `CAMERAS` | every IPC | `name=<deviceId>:/path,…` (path optional) |
+| `RECORD_DIR` | — | recordings root; unset disables recording |
+| `SEGMENT_SECONDS` | `600` | mp4 segment length |
+| `RECORD_FPS` | `12` | recording framerate (keep below the camera's real fps) |
+| `RECORD_CRF` | `26` | x264 quality (lower = bigger/better) |
+| `RETENTION_DAYS` | `3` | delete recordings older than this |
+| `SNAPSHOT_INTERVAL` | `5` | seconds between `now.png` refreshes (`0` = off) |
+| `SNAPSHOT_KEEP` | `0` | `1` also writes timestamped `<ts>.png` files |
+| `RTSP_BASE` | — | if set, re-publishes to `<base>/<name>` |
+| `RTSP_FPS` | `15` | re-publish framerate |
+
+### Building a timelapse
+
+Speed up a day of recordings with ffmpeg:
+
+```bash
+DAY=20260910; CAM=cam0
+ls /mnt/hdd/aidot/$CAM/$DAY-*.mp4 | sed "s/^/file '/;s/$/'/" > /tmp/list.txt
+ffmpeg -f concat -safe 0 -i /tmp/list.txt -an \
+  -vf "setpts=PTS/60,fps=30" -c:v libx264 -crf 23 $CAM-$DAY-timelapse.mp4
+```
 
 ---
 
-## Herramientas
+## Tools
 
-* `tools/capture_signaling.py` — captura la señalización con el performance log
-  de Selenium (CDP), incluyendo frames WebSocket dentro de Web Workers.
-* `tools/decode_mqtt.py` — reensambla los frames y decodifica los paquetes MQTT.
+* `tools/capture_signaling.py` — captures the signaling with the Selenium
+  performance log (CDP), including WebSocket frames inside Web Workers.
+* `tools/decode_mqtt.py` — reassembles the frames and decodes the MQTT packets.
 
-Sirven para re-descubrir el protocolo si aiDot cambia algo.
+Use these to re-discover the protocol if aiDot changes something.
 
 ---
 
-## Limitaciones
+## Limitations
 
-* El handshake **depende de la nube de aiDot**. Si sus servidores se caen, no
-  hay stream (el media sí es local, la negociación no).
-* Protocolo obtenido por ingeniería inversa del webapp: puede romperse con
-  cualquier actualización de firmware o de la API.
-* `aiortc` decodifica el H.264 a frames; para republicar a RTSP se reencodea.
-  Es mucho más barato que Chrome, pero no es passthrough puro.
+* The handshake **depends on aiDot's cloud**. If their servers go down there is
+  no stream (the media is local, the negotiation is not).
+* Protocol reverse-engineered from the webapp — may break with any firmware or
+  API update.
+* `aiortc` decodes H.264 to frames; recording and RTSP re-encode. Far cheaper
+  than Chrome, but not a pure passthrough.
+* cam1 (weaker Wi-Fi) drops and reconnects periodically; the run loop recovers
+  after ~10s.

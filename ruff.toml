@@ -1,0 +1,6 @@
+line-length = 100
+
+[lint]
+# pyflakes (unused imports/names, undefined names) + syntax errors + bugbear.
+# Deliberately not enforcing full pycodestyle style here.
+select = ["F", "E9", "B"]

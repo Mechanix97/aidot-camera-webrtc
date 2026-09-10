@@ -1,7 +1,7 @@
-"""Cliente HTTP de la API arnoo (aiDot / Leedarson).
+"""HTTP client for the arnoo API (aiDot / Leedarson).
 
-Sin dependencias externas: el cifrado RSA PKCS#1 v1.5 del password se hace
-a mano sobre la clave publica extraida del bundle JS del webapp.
+No external dependencies: the RSA PKCS#1 v1.5 encryption of the password is
+done by hand against the public key lifted from the webapp JS bundle.
 """
 import base64
 import json
@@ -14,7 +14,7 @@ import urllib.request
 
 BASE = "https://prod-us-api.arnoo.com/v29"
 APP_ID = "1383974540041977857"
-# Clave publica RSA-1024 extraida de https://app.aidot.com/static/js/main.*.js
+# RSA-1024 public key lifted from https://app.aidot.com/static/js/main.*.js
 RSA_PUB_SPKI_B64 = (
     "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCtQAnPCi8ksPnS1Du6z96PsKfNp2Gp"
     "/f/bHwlrAdplbX3p7/TnGpnbJGkLq8uRxf6cw+vOthTsZjkPCF7CatRvRnTjc9fcy7yE"
@@ -41,12 +41,12 @@ def _der_read_tlv(buf, i):
 
 
 def _parse_spki(der):
-    """Devuelve (n, e) de una SubjectPublicKeyInfo RSA."""
-    _, seq, _ = _der_read_tlv(der, 0)              # SEQUENCE exterior
+    """Return (n, e) from an RSA SubjectPublicKeyInfo."""
+    _, seq, _ = _der_read_tlv(der, 0)              # outer SEQUENCE
     _, _algid, j = _der_read_tlv(seq, 0)           # AlgorithmIdentifier
     tag, bitstr, _ = _der_read_tlv(seq, j)         # BIT STRING
-    assert tag == 0x03, "esperaba BIT STRING"
-    inner = bitstr[1:]                             # saltear byte de bits no usados
+    assert tag == 0x03, "expected BIT STRING"
+    inner = bitstr[1:]                             # skip the unused-bits byte
     _, rsaseq, _ = _der_read_tlv(inner, 0)         # SEQUENCE { n, e }
     tag, nb, k = _der_read_tlv(rsaseq, 0)
     tag2, eb, _ = _der_read_tlv(rsaseq, k)
@@ -54,14 +54,14 @@ def _parse_spki(der):
 
 
 def rsa_encrypt_pkcs1v15(plaintext: bytes) -> str:
-    """Cifra como lo hace JSEncrypt y devuelve base64."""
+    """Encrypt the way JSEncrypt does and return base64."""
     n, e = _parse_spki(base64.b64decode(RSA_PUB_SPKI_B64))
     k = (n.bit_length() + 7) // 8
     if len(plaintext) > k - 11:
-        raise ValueError("plaintext demasiado largo para la clave")
+        raise ValueError("plaintext too long for the key")
     ps_len = k - len(plaintext) - 3
     ps = bytearray()
-    while len(ps) < ps_len:                        # padding: bytes != 0
+    while len(ps) < ps_len:                        # padding: non-zero bytes
         b = os.urandom(ps_len - len(ps))
         ps.extend(x for x in b if x != 0)
     em = b"\x00\x02" + bytes(ps[:ps_len]) + b"\x00" + plaintext
@@ -74,7 +74,7 @@ def rand_id(n=21):
     return "".join(random.choice(alpha) for _ in range(n))
 
 
-# ---------------------------------------------------------------- cliente
+# ---------------------------------------------------------------- client
 
 class AidotAPI:
     def __init__(self, username, password, country_key="region:UnitedStates"):
@@ -87,7 +87,7 @@ class AidotAPI:
         self.user_id = None
         self.house_id = None
 
-    # -- transporte
+    # -- transport
     def _req(self, method, path, body=None, auth=True, base=BASE):
         url = base + path
         now = __import__("datetime").datetime.now()
@@ -129,7 +129,7 @@ class AidotAPI:
         self.token = r.get("accessToken") or r.get("token")
         self.user_id = r.get("id") or r.get("userId")
         if not self.token:
-            raise RuntimeError(f"login sin accessToken: {json.dumps(r)[:400]}")
+            raise RuntimeError(f"login without accessToken: {json.dumps(r)[:400]}")
         return r
 
     def houses(self):

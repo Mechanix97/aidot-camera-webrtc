@@ -3,15 +3,17 @@ services:
     build: .
     image: aidot-webrtc:latest
     container_name: aidot-webrtc
-    # como lucas: los PNGs quedan lucas:lucas y timelapse.py (cron, uid 1000)
-    # los puede borrar despues de armar el mp4.
+    # Run as lucas (uid 1000): recordings/snapshots stay owned by the host user
+    # so timelapse.py (cron, uid 1000) can read and clean them.
     user: "1000:1000"
-    # host: los candidatos ICE locales tienen que ser los reales de la LAN,
-    # si no el media se va por TURN (o no conecta).
+    # host networking: the local ICE candidates must be the real LAN ones,
+    # otherwise the media falls back to TURN (or fails to connect).
     network_mode: host
     env_file:
       - .env
     volumes:
-      # mismo destino que leia timelapse.py: /home/lucas/home-assistant/data/{cam0,cam1}
+      # now.png for Home Assistant's local_file camera
       - /home/lucas/home-assistant/data:/data
+      # continuous recordings — on the big NTFS disk, not the 100 GB root fs
+      - /mnt/hdd/aidot:/rec
     restart: unless-stopped

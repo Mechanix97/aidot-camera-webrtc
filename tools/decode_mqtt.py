@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Decodifica los frames MQTT-over-WebSocket capturados por capture_signaling.py.
+"""Decode the MQTT-over-WebSocket frames captured by capture_signaling.py.
 
-CDP entrega los mensajes WS fragmentados (el header fijo MQTT suele venir en un
-frame y el resto en el siguiente), asi que hay que reensamblar el stream por
-conexion y direccion antes de parsear.
+CDP delivers WS messages fragmented (the fixed MQTT header often lands in one
+frame and the rest in the next), so the stream has to be reassembled per
+connection and direction before parsing.
 """
 import base64, glob, json, os, sys
 from collections import defaultdict
@@ -102,7 +102,7 @@ def main():
     print(f"capture: {os.path.basename(path)}")
     print(f"websockets: {[w['url'] for w in cap['ws_created']]}\n")
 
-    # reensamblar por (conexion, direccion)
+    # reassemble per (connection, direction)
     streams = defaultdict(bytes)
     order = []
     for f in cap["ws_frames"]:
