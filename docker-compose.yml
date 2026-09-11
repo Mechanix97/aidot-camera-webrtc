@@ -18,3 +18,13 @@ services:
       # one consolidated mp4 per camera per day (DAILY_DIR=/daily)
       - /mnt/hdd/aidot-daily:/daily
     restart: unless-stopped
+
+  # Live view: aidot-webrtc re-publishes each camera to RTSP (RTSP_BASE in
+  # .env), mediamtx fans that out as HLS/WebRTC for browsers to watch.
+  # host networking so aidot-webrtc can reach it at rtsp://127.0.0.1:8554
+  # without a shared compose network (aidot-webrtc itself is host-networked).
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx
+    network_mode: host
+    restart: unless-stopped
