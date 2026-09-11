@@ -232,12 +232,66 @@ def prune_old(root, retention_days):
     return removed
 
 
+def _probe_duration(path):
+    """Seconds of media in `path`, or 0.0 if ffprobe can't tell."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        return max(0.0, float(r.stdout.strip()))
+    except Exception:
+        return 0.0
+
+
+def _concat_copy(paths, listfile, out_path):
+    """Fast path: stream-copy concat via the concat demuxer.
+
+    Known failure mode: if this process was restarted mid-day (a redeploy, a
+    host reboot), segments recorded before and after can carry slightly
+    different H.264 parameter sets. The concat demuxer's automatic bitstream
+    filter then corrupts at that boundary and ffmpeg silently stops there --
+    exit code 0, but the file only has the first stretch. Caller must verify
+    the duration.
+    """
+    with open(listfile, "w") as fh:
+        for p in paths:
+            fh.write(f"file '{p}'\n")
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+           "-f", "concat", "-safe", "0", "-i", listfile,
+           "-c", "copy", "-movflags", "+faststart", "-f", "mp4", out_path]
+    rc = subprocess.run(cmd).returncode
+    os.remove(listfile)
+    return rc == 0 and os.path.isfile(out_path)
+
+
+def _concat_reencode(paths, out_path):
+    """Slow path: decode every segment and re-encode through the concat
+    *filter* instead of the concat demuxer -- immune to the parameter-set
+    mismatch above, since each input is decoded independently. Used only
+    when _concat_copy's output comes up short.
+    """
+    args = []
+    for p in paths:
+        args += ["-i", p]
+    n = len(paths)
+    filt = "".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args,
+           "-filter_complex", filt, "-map", "[v]",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+           "-movflags", "+faststart", "-f", "mp4", out_path]
+    rc = subprocess.run(cmd).returncode
+    return rc == 0 and os.path.isfile(out_path)
+
+
 def concat_day(seg_dir, daily_dir, day):
     """Stitch one day's segments into daily_dir/<cam>/<day>.mp4 per camera.
 
-    `day` is a YYYYMMDD string; segments are `<day>-*.mp4`. Uses ffmpeg's
-    concat demuxer with stream copy (no re-encode), so it is fast and lossless,
-    and writes +faststart for quick seeking. Consolidated segments are deleted.
+    `day` is a YYYYMMDD string; segments are `<day>-*.mp4`. Tries ffmpeg's
+    concat demuxer with stream copy first (fast, lossless); if that silently
+    truncates (see _concat_copy), falls back to a decode+re-encode concat.
+    Writes +faststart for quick seeking. Consolidated segments are deleted.
     Returns a dict {camera: bytes_written} for the files it produced.
     """
     out = {}
@@ -254,24 +308,31 @@ def concat_day(seg_dir, daily_dir, day):
             continue
 
         os.makedirs(os.path.join(daily_dir, cam), exist_ok=True)
+        paths = [os.path.join(camdir, s) for s in segs]
         listfile = os.path.join(camdir, f".concat-{day}.txt")
-        with open(listfile, "w") as fh:
-            for s in segs:
-                fh.write(f"file '{os.path.join(camdir, s)}'\n")
-
         dst = os.path.join(daily_dir, cam, f"{day}.mp4")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-               "-f", "concat", "-safe", "0", "-i", listfile,
-               "-c", "copy", "-movflags", "+faststart", dst]
-        rc = subprocess.run(cmd).returncode
-        os.remove(listfile)
-        if rc == 0:
+        tmp_dst = dst + ".tmp"
+
+        ok = _concat_copy(paths, listfile, tmp_dst)
+        if ok:
+            expected = sum(_probe_duration(p) for p in paths)
+            actual = _probe_duration(tmp_dst)
+            if actual < expected - 5:
+                log.warning("[%s] concat copy of %s truncated (%.0fs of %.0fs "
+                           "expected) -- falling back to re-encode",
+                           cam, day, actual, expected)
+                ok = False
+        if not ok:
+            ok = _concat_reencode(paths, tmp_dst)
+
+        if ok:
+            os.replace(tmp_dst, dst)
             for s in segs:
                 os.remove(os.path.join(camdir, s))
             out[cam] = os.path.getsize(dst)
             log.info("[%s] consolidated %s (%d segments -> %.1f MB)",
                      cam, day, len(segs), out[cam] / 1e6)
         else:
-            log.warning("[%s] concat of %s failed (rc=%d), segments kept",
-                        cam, day, rc)
+            log.warning("[%s] concat of %s failed entirely, segments kept",
+                        cam, day)
     return out
