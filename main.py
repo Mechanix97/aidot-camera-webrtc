@@ -73,47 +73,101 @@ async def run_camera(sig, cam, ice_cfg, opts):
     if opts["record_dir"]:
         recorder = SegmentRecorder(name, os.path.join(opts["record_dir"], name),
                                    segment_seconds=opts["segment_seconds"],
-                                   fps=opts["record_fps"], crf=opts["record_crf"])
+                                   fps=opts["record_fps"], crf=opts["record_crf"],
+                                   capture_latency=opts["capture_latency"])
     rec_period = 1.0 / opts["record_fps"]
+    # newest frame off the wire, shared between the receive loop and the pacer
+    latest = {"frame": None, "at": 0.0}
 
-    while True:
-        stream = CameraStream(sig, did, ice_cfg, name=name)
-        try:
-            track = await stream.connect()
-            log.info("[%s] connected, receiving video", name)
-            last_snap = 0.0
-            last_rec = 0.0
-            while True:
-                frame = await asyncio.wait_for(track.recv(), timeout=20)
-                now = time.time()
+    async def pacer():
+        """Feed the recorder one frame every 1/fps of *wall-clock* time.
 
-                if sink:
-                    sink.write(frame)
+        This is what makes a recording's position mean something: ffmpeg is
+        told `-r fps` on its rawvideo input, so it assumes every frame it gets
+        is exactly 1/fps after the previous one. If we only wrote frames as
+        they arrived (the camera stalls, or a reconnect takes 20s), the file
+        would come out shorter than the wall-clock time it covers, and every
+        position after the stall would map to a time that is too early --
+        drift that accumulates all day.
 
-                # recording: paced to record_fps so duration == wall-clock time
-                if recorder and now - last_rec >= rec_period:
-                    recorder.write(frame)
-                    last_rec = now
+        So we tick on the clock instead, repeating the last frame when nothing
+        new has arrived. A frozen frame costs almost nothing at this bitrate,
+        and in exchange video position == real elapsed time, exactly.
 
-                # now.png for Home Assistant (+ timestamped PNGs if SNAPSHOT_KEEP=1)
-                if path and opts["snap_interval"] and now - last_snap >= opts["snap_interval"]:
-                    last_snap = now
-                    img = frame.to_image()
-                    img.save(os.path.join(path, "now.png"))
-                    if opts["snap_keep"]:
-                        ts = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
-                        img.save(os.path.join(path, f"{ts}.png"))
-        except asyncio.CancelledError:
-            if recorder:
-                recorder.close()
-            raise
-        except Exception as ex:
-            log.warning("[%s] session dropped (%s), retrying in 10s", name, ex)
-        finally:
-            # keep the recorder's ffmpeg alive across reconnects so a flaky
-            # camera produces one continuous segment, not a pile of stubs.
-            await stream.close()
-        await asyncio.sleep(10)
+        Past `fill_max_seconds` of silence we stop filling and close the
+        recorder: the next frame starts a fresh segment whose filename carries
+        the real restart time, so the timeline re-anchors instead of pretending
+        an hours-long outage was a frozen picture.
+        """
+        loop = asyncio.get_running_loop()
+        next_tick = time.time()
+        last_index = 0.0
+        while True:
+            next_tick += rec_period
+            await asyncio.sleep(max(0.0, next_tick - time.time()))
+            if time.time() - next_tick > 5:   # fell far behind; don't burst
+                next_tick = time.time()
+
+            if time.time() - last_index > 2:
+                last_index = time.time()
+                await loop.run_in_executor(None, recorder.sync_index)
+
+            frame, at = latest["frame"], latest["at"]
+            if frame is None:
+                next_tick = time.time()
+                continue
+
+            stalled = time.time() - at
+            if stalled > opts["fill_max_seconds"]:
+                if recorder.is_open():
+                    log.info("[%s] no frames for %.0fs, closing the segment",
+                             name, stalled)
+                    await loop.run_in_executor(None, recorder.close)
+                next_tick = time.time()
+                continue
+
+            # stdin writes are blocking; keep them off the event loop
+            await loop.run_in_executor(None, recorder.write, frame)
+
+    pacer_task = asyncio.ensure_future(pacer()) if recorder else None
+
+    try:
+        while True:
+            stream = CameraStream(sig, did, ice_cfg, name=name)
+            try:
+                track = await stream.connect()
+                log.info("[%s] connected, receiving video", name)
+                last_snap = 0.0
+                while True:
+                    frame = await asyncio.wait_for(track.recv(), timeout=20)
+                    now = time.time()
+                    latest["frame"], latest["at"] = frame, now
+
+                    if sink:
+                        sink.write(frame)
+
+                    # now.png for Home Assistant (+ timestamped PNGs if SNAPSHOT_KEEP=1)
+                    if path and opts["snap_interval"] and now - last_snap >= opts["snap_interval"]:
+                        last_snap = now
+                        img = frame.to_image()
+                        img.save(os.path.join(path, "now.png"))
+                        if opts["snap_keep"]:
+                            ts = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
+                            img.save(os.path.join(path, f"{ts}.png"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                log.warning("[%s] session dropped (%s), retrying in 10s", name, ex)
+            finally:
+                # the recorder's ffmpeg stays alive across reconnects; the
+                # pacer keeps the timeline moving while we get back on
+                await stream.close()
+            await asyncio.sleep(10)
+    finally:
+        if pacer_task:
+            pacer_task.cancel()
+        if recorder:
+            recorder.close()
 
 
 async def retention_loop(record_dir, retention_days):
@@ -161,6 +215,11 @@ async def main():
         "segment_seconds": int(env("SEGMENT_SECONDS", "600")),
         "record_fps": int(env("RECORD_FPS", "12")),
         "record_crf": int(env("RECORD_CRF", "26")),
+        # how long to keep filling with the last frame before giving up and
+        # cutting the segment (see run_camera's pacer)
+        "fill_max_seconds": float(env("FILL_MAX_SECONDS", "300")),
+        # camera -> us pipeline delay, subtracted from the timeline anchor
+        "capture_latency": float(env("CAPTURE_LATENCY_SECONDS", "3.0")),
     }
     retention_days = int(env("RETENTION_DAYS", "3"))          # segment retention
     daily_dir = env("DAILY_DIR")                             # set -> nightly one-file-per-day

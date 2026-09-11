@@ -9,6 +9,7 @@ handshake. From the decoded frames we can:
   * re-publish to RTSP (for go2rtc / Frigate / Home Assistant)
 """
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -151,6 +152,9 @@ class _FfmpegPipe:
                "-r", str(self.fps), "-i", "-"] + self._args(w, h)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
+    def is_open(self):
+        return self.proc is not None and self.proc.poll() is None
+
     def write(self, frame):
         if self.proc is None or self.proc.poll() is not None:
             self._start(frame.width, frame.height)
@@ -167,6 +171,7 @@ class _FfmpegPipe:
                 self.proc.wait(timeout=10)
             except Exception:
                 self.proc.kill()
+        self.proc = None  # next write() starts a fresh process (and segment)
 
 
 class FfmpegSink(_FfmpegPipe):
@@ -187,17 +192,84 @@ class SegmentRecorder(_FfmpegPipe):
     """Record the track to segmented mp4 files (one folder per camera).
 
     ffmpeg re-encodes the decoded rawvideo to H.264 and cuts a new file every
-    `segment_seconds`. Filenames are `%Y%m%d-%H%M%S.mp4` in the container's
-    local time. The caller paces writes to `fps` so the file duration matches
-    wall-clock time even when the camera's framerate drifts.
+    `segment_seconds`. The caller paces writes to `fps` on the wall clock, so
+    a segment's content duration equals the real time it covers.
+
+    Segment *filenames* carry ffmpeg's `-strftime` stamp, but that is the
+    moment the muxer opened the file -- which lags the first frame we fed it
+    by however long the encoder buffered (measured at ~12s here). Anchoring a
+    timeline to the filename therefore skews everything by that much, so each
+    recording session also writes a `.session-<epoch>.json` index:
+
+        {"start_epoch": <when we wrote the first frame>,
+         "fps": 10, "tz_offset": -10800,
+         "segments": ["20260911-002826.mp4", ...]}   # in order
+
+    A segment's true start is then `start_epoch + sum(durations before it)`,
+    both of which are measured rather than inferred. A new session (and a new
+    anchor) begins whenever ffmpeg is restarted -- a long outage, a crash, a
+    redeploy -- so the timeline re-anchors instead of drifting.
     """
 
-    def __init__(self, name, out_dir, segment_seconds=600, fps=12, crf=26):
+    def __init__(self, name, out_dir, segment_seconds=600, fps=12, crf=26,
+                 capture_latency=3.0):
         super().__init__(name, fps)
         self.out_dir = out_dir
         self.segment_seconds = segment_seconds
         self.crf = crf
+        # A frame reaches us later than the camera shot it: encode on the
+        # camera, network, jitter buffer, decode. Measured against the clock
+        # this camera burns into the picture, that came to a steady 3s across
+        # a 10-hour recording, so the anchor is shifted back by it -- making
+        # `start_epoch` mean "when this frame was taken", not "when we saw it".
+        self.capture_latency = capture_latency
+        self.session_start = None
+        self._index_path = None
+        self._known = []
         os.makedirs(out_dir, exist_ok=True)
+
+    def write(self, frame):
+        if self.session_start is None:
+            self.session_start = time.time() - self.capture_latency
+            self._index_path = os.path.join(
+                self.out_dir, f".session-{int(self.session_start)}.json")
+            self._known = []
+        super().write(frame)
+
+    def close(self):
+        super().close()
+        self.session_start = None  # next write() opens a new session
+
+    def sync_index(self):
+        """Note any segment files this session has produced, in order.
+
+        Cheap enough to call every couple of seconds: one listdir plus a stat
+        per file. Only the ordering matters -- offsets come from the segments'
+        own durations later -- so noticing a file late is harmless.
+        """
+        if self.session_start is None:
+            return
+        try:
+            names = sorted(
+                f for f in os.listdir(self.out_dir)
+                if f.endswith(".mp4")
+                and os.path.getctime(os.path.join(self.out_dir, f))
+                >= self.session_start - 5
+            )
+        except OSError:
+            return
+        if names == self._known:
+            return
+        self._known = names
+        tmp = self._index_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({
+                "start_epoch": self.session_start,
+                "fps": self.fps,
+                "tz_offset": -time.timezone if not time.daylight else -time.altzone,
+                "segments": names,
+            }, fh)
+        os.replace(tmp, self._index_path)
 
     def _args(self, w, h):
         pattern = os.path.join(self.out_dir, "%Y%m%d-%H%M%S.mp4")
@@ -266,6 +338,52 @@ def _concat_copy(paths, listfile, out_path):
     return rc == 0 and os.path.isfile(out_path)
 
 
+def _enough(out_path, expected):
+    """Did a concat actually produce (most of) the footage it was given?"""
+    return _probe_duration(out_path) >= expected * 0.98
+
+
+def _session_fps(camdir, default=10):
+    try:
+        for f in sorted(os.listdir(camdir), reverse=True):
+            if f.startswith(".session-"):
+                with open(os.path.join(camdir, f)) as fh:
+                    return int(json.load(fh).get("fps", default))
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def _concat_annexb(paths, out_path, fps):
+    """Middle path: strip each segment to an Annex-B elementary stream, glue
+    those together, and re-wrap once.
+
+    The concat demuxer trips over segments whose parameter sets disagree
+    because it tries to bridge containers; taking the container out of the
+    picture first sidesteps that. Still no decoding, so it costs roughly what
+    a file copy costs, against minutes for a re-encode of the same footage.
+    """
+    raw = out_path + ".h264"
+    try:
+        with open(raw, "wb") as out:
+            for p in paths:
+                r = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-i", p, "-map", "0:v:0",
+                     "-c:v", "copy", "-bsf:v", "h264_mp4toannexb",
+                     "-f", "h264", "pipe:1"],
+                    stdout=subprocess.PIPE,
+                )
+                out.write(r.stdout)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "h264", "-r", str(fps), "-i", raw,
+               "-c:v", "copy", "-movflags", "+faststart", "-f", "mp4", out_path]
+        rc = subprocess.run(cmd).returncode
+        return rc == 0 and os.path.isfile(out_path)
+    finally:
+        if os.path.exists(raw):
+            os.remove(raw)
+
+
 def _concat_reencode(paths, out_path):
     """Slow path: decode every segment and re-encode through the concat
     *filter* instead of the concat demuxer -- immune to the parameter-set
@@ -283,6 +401,61 @@ def _concat_reencode(paths, out_path):
            "-movflags", "+faststart", "-f", "mp4", out_path]
     rc = subprocess.run(cmd).returncode
     return rc == 0 and os.path.isfile(out_path)
+
+
+def _seconds_of_day(epoch, tz_offset):
+    return (epoch + tz_offset) % 86400
+
+
+def build_breaks(camdir, segnames, probe=None):
+    """Map positions in a concatenation of `segnames` to wall-clock time.
+
+    Returns [{cum, wall, dur}]: `cum` seconds into the concatenated video
+    correspond to second-of-day `wall`, for `dur` seconds.
+
+    Anchors come from the session indexes SegmentRecorder writes (the epoch at
+    which we fed ffmpeg its first frame, plus the ordered segment list), so a
+    segment's start is `session_start + the duration of everything recorded
+    before it in that session` -- measured, not guessed. Segments with no
+    session index (recorded before this existed) fall back to their filename
+    stamp, which lags reality by however long the encoder buffered.
+    """
+    probe = probe or _probe_duration
+    durs = {}
+
+    def dur_of(name):
+        if name not in durs:
+            durs[name] = probe(os.path.join(camdir, name))
+        return durs[name]
+
+    # segment filename -> its true start, via the session that produced it
+    starts = {}
+    try:
+        indexes = [f for f in os.listdir(camdir) if f.startswith(".session-")]
+    except OSError:
+        indexes = []
+    for idx in sorted(indexes):
+        try:
+            with open(os.path.join(camdir, idx)) as fh:
+                sess = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        offset = 0.0
+        for name in sess.get("segments", []):
+            starts[name] = _seconds_of_day(sess["start_epoch"] + offset,
+                                           sess.get("tz_offset", 0))
+            offset += dur_of(name)
+
+    breaks, cum = [], 0.0
+    for name in segnames:
+        wall = starts.get(name)
+        if wall is None:  # pre-index recording: fall back to the filename
+            hhmmss = name[9:15]
+            wall = int(hhmmss[0:2]) * 3600 + int(hhmmss[2:4]) * 60 + int(hhmmss[4:6])
+        d = dur_of(name)
+        breaks.append({"cum": round(cum, 2), "wall": round(wall, 2), "dur": round(d, 2)})
+        cum += d
+    return breaks
 
 
 def concat_day(seg_dir, daily_dir, day):
@@ -313,19 +486,33 @@ def concat_day(seg_dir, daily_dir, day):
         dst = os.path.join(daily_dir, cam, f"{day}.mp4")
         tmp_dst = dst + ".tmp"
 
-        ok = _concat_copy(paths, listfile, tmp_dst)
-        if ok:
-            expected = sum(_probe_duration(p) for p in paths)
-            actual = _probe_duration(tmp_dst)
-            if actual < expected - 5:
-                log.warning("[%s] concat copy of %s truncated (%.0fs of %.0fs "
-                           "expected) -- falling back to re-encode",
-                           cam, day, actual, expected)
-                ok = False
+        expected = sum(_probe_duration(p) for p in paths)
+
+        # cheapest first, each one only tried if the last came up short.
+        # `_enough` tolerates scattered dropped frames around corrupt packets
+        # but still catches the truncation _concat_copy warns about.
+        ok = (_concat_copy(paths, listfile, tmp_dst)
+              and _enough(tmp_dst, expected))
         if not ok:
+            log.warning("[%s] stream-copy concat of %s came up short of %.0fs "
+                        "-- repackaging via Annex-B", cam, day, expected)
+            ok = (_concat_annexb(paths, tmp_dst, _session_fps(camdir))
+                  and _enough(tmp_dst, expected))
+        if not ok:
+            log.warning("[%s] Annex-B repackage of %s came up short too "
+                        "-- re-encoding", cam, day)
             ok = _concat_reencode(paths, tmp_dst)
 
         if ok:
+            # Timeline sidecar: where each segment landed in the consolidated
+            # file and the wall-clock second of the day it really started at.
+            # Without this a consumer can only assume the day's video starts
+            # at 00:00:00, which is wrong for any day that didn't record from
+            # midnight. Written next to the mp4 so the file carries its own
+            # timeline, and computed *before* the segments are deleted.
+            with open(os.path.join(daily_dir, cam, f"{day}.json"), "w") as fh:
+                json.dump(build_breaks(camdir, segs), fh)
+
             os.replace(tmp_dst, dst)
             for s in segs:
                 os.remove(os.path.join(camdir, s))
