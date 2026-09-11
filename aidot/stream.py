@@ -212,25 +212,35 @@ class SegmentRecorder(_FfmpegPipe):
     """
 
     def __init__(self, name, out_dir, segment_seconds=600, fps=12, crf=26,
-                 capture_latency=3.0):
+                 capture_latency=0.0):
         super().__init__(name, fps)
         self.out_dir = out_dir
         self.segment_seconds = segment_seconds
         self.crf = crf
-        # A frame reaches us later than the camera shot it: encode on the
-        # camera, network, jitter buffer, decode. Measured against the clock
-        # this camera burns into the picture, that came to a steady 3s across
-        # a 10-hour recording, so the anchor is shifted back by it -- making
-        # `start_epoch` mean "when this frame was taken", not "when we saw it".
+        # Shifts the anchor back by the camera -> us pipeline delay, so
+        # `start_epoch` would mean "when this was filmed" rather than "when we
+        # saw it". Left at 0 by default: checked against the clock this camera
+        # burns into the picture, the remaining error bounced between -2s and
+        # +4s with no consistent sign, so there is no bias worth subtracting.
+        # Most of that spread is honest anyway -- while the camera is quiet the
+        # pacer holds the last frame, so a frame there really is a few seconds
+        # older than its position. Bounded by the stall, and it doesn't
+        # accumulate. The knob is here in case a setup shows a real, steady lag.
         self.capture_latency = capture_latency
         self.session_start = None
+        self._proc_start = None
         self._index_path = None
         self._known = []
         os.makedirs(out_dir, exist_ok=True)
 
     def write(self, frame):
         if self.session_start is None:
-            self.session_start = time.time() - self.capture_latency
+            # two different clocks on purpose: `session_start` is shifted back
+            # to when the frame was filmed (that is what the timeline means),
+            # while `_proc_start` stays honest about when this process began,
+            # so deciding which files it produced isn't skewed by the shift
+            self._proc_start = time.time()
+            self.session_start = self._proc_start - self.capture_latency
             self._index_path = os.path.join(
                 self.out_dir, f".session-{int(self.session_start)}.json")
             self._known = []
@@ -254,7 +264,7 @@ class SegmentRecorder(_FfmpegPipe):
                 f for f in os.listdir(self.out_dir)
                 if f.endswith(".mp4")
                 and os.path.getctime(os.path.join(self.out_dir, f))
-                >= self.session_start - 5
+                >= self._proc_start - 5
             )
         except OSError:
             return

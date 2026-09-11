@@ -218,8 +218,9 @@ async def main():
         # how long to keep filling with the last frame before giving up and
         # cutting the segment (see run_camera's pacer)
         "fill_max_seconds": float(env("FILL_MAX_SECONDS", "300")),
-        # camera -> us pipeline delay, subtracted from the timeline anchor
-        "capture_latency": float(env("CAPTURE_LATENCY_SECONDS", "3.0")),
+        # camera -> us pipeline delay, subtracted from the timeline anchor.
+        # 0 unless you measure a steady lag; see SegmentRecorder.
+        "capture_latency": float(env("CAPTURE_LATENCY_SECONDS", "0")),
     }
     retention_days = int(env("RETENTION_DAYS", "3"))          # segment retention
     daily_dir = env("DAILY_DIR")                             # set -> nightly one-file-per-day
