@@ -231,6 +231,7 @@ class SegmentRecorder(_FfmpegPipe):
         self._proc_start = None
         self._index_path = None
         self._known = []
+        self._starts = {}   # segment name -> epoch of its first frame
         os.makedirs(out_dir, exist_ok=True)
 
     def write(self, frame):
@@ -244,6 +245,7 @@ class SegmentRecorder(_FfmpegPipe):
             self._index_path = os.path.join(
                 self.out_dir, f".session-{int(self.session_start)}.json")
             self._known = []
+            self._starts = {}
         super().write(frame)
 
     def close(self):
@@ -251,11 +253,21 @@ class SegmentRecorder(_FfmpegPipe):
         self.session_start = None  # next write() opens a new session
 
     def sync_index(self):
-        """Note any segment files this session has produced, in order.
+        """Record where each segment this session produced starts, absolutely.
 
         Cheap enough to call every couple of seconds: one listdir plus a stat
-        per file. Only the ordering matters -- offsets come from the segments'
-        own durations later -- so noticing a file late is harmless.
+        per file, and one ffprobe per *new* segment -- so once per segment
+        length, on a file that has just been closed and can't change again.
+
+        Each segment gets its own epoch rather than a position in a list, and
+        once assigned it is never recomputed. That matters because this list
+        is built from what is on disk, and things leave disk: the nightly
+        consolidation deletes a day's segments once it has stitched them. When
+        that happened under the old position-based scheme, whatever survived
+        became "segment 0" and inherited the session's start epoch -- so a
+        file recorded at 00:05 claimed to start at the session's 10:45, and
+        every consumer's timeline broke. An absolute epoch per segment cannot
+        be re-anchored by a deletion.
         """
         if self.session_start is None:
             return
@@ -268,8 +280,18 @@ class SegmentRecorder(_FfmpegPipe):
             )
         except OSError:
             return
-        if names == self._known:
+        fresh = [n for n in names if n not in self._starts]
+        if not fresh and names == self._known:
             return
+        for name in fresh:
+            if not self._starts:
+                self._starts[name] = self.session_start
+            else:
+                # the segment before this one is closed now, so its duration is
+                # final: this one starts exactly where that one ended
+                prev = max(self._starts, key=self._starts.get)
+                self._starts[name] = self._starts[prev] + _probe_duration(
+                    os.path.join(self.out_dir, prev))
         self._known = names
         tmp = self._index_path + ".tmp"
         with open(tmp, "w") as fh:
@@ -278,6 +300,7 @@ class SegmentRecorder(_FfmpegPipe):
                 "fps": self.fps,
                 "tz_offset": -time.timezone if not time.daylight else -time.altzone,
                 "segments": names,
+                "starts": self._starts,
             }, fh)
         os.replace(tmp, self._index_path)
 
@@ -417,6 +440,12 @@ def _seconds_of_day(epoch, tz_offset):
     return (epoch + tz_offset) % 86400
 
 
+def _apart(a, b):
+    """Seconds between two times of day, the short way around midnight."""
+    d = abs(a - b) % 86400
+    return min(d, 86400 - d)
+
+
 def build_breaks(camdir, segnames, probe=None):
     """Map positions in a concatenation of `segnames` to wall-clock time.
 
@@ -450,18 +479,29 @@ def build_breaks(camdir, segnames, probe=None):
                 sess = json.load(fh)
         except (OSError, ValueError):
             continue
+        tz = sess.get("tz_offset", 0)
+        if sess.get("starts"):
+            # newer recorders write each segment's own epoch, which a deletion
+            # elsewhere in the session cannot shift -- see sync_index
+            for name, epoch in sess["starts"].items():
+                starts[name] = _seconds_of_day(epoch, tz)
+            continue
         offset = 0.0
         for name in sess.get("segments", []):
-            starts[name] = _seconds_of_day(sess["start_epoch"] + offset,
-                                           sess.get("tz_offset", 0))
+            starts[name] = _seconds_of_day(sess["start_epoch"] + offset, tz)
             offset += dur_of(name)
 
     breaks, cum = [], 0.0
     for name in segnames:
         wall = starts.get(name)
-        if wall is None:  # pre-index recording: fall back to the filename
-            hhmmss = name[9:15]
-            wall = int(hhmmss[0:2]) * 3600 + int(hhmmss[2:4]) * 60 + int(hhmmss[4:6])
+        hhmmss = name[9:15]
+        stamp = int(hhmmss[0:2]) * 3600 + int(hhmmss[2:4]) * 60 + int(hhmmss[4:6])
+        # The stamp lags the first frame by however long the encoder buffered,
+        # so an index anchor is better -- but only while it still describes
+        # reality. The stamp is never wildly wrong, so it referees: an index
+        # that disagrees by minutes has gone stale and is discarded.
+        if wall is None or _apart(wall, stamp) > 300:
+            wall = stamp
         d = dur_of(name)
         breaks.append({"cum": round(cum, 2), "wall": round(wall, 2), "dur": round(d, 2)})
         cum += d
