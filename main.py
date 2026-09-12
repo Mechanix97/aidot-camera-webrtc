@@ -60,6 +60,7 @@ def parse_cameras():
 
 
 async def run_camera(sig, cam, ice_cfg, opts):
+    loop = asyncio.get_running_loop()
     name, did, path = cam["name"], cam["device_id"], cam["path"]
     if path:
         os.makedirs(path, exist_ok=True)
@@ -67,7 +68,7 @@ async def run_camera(sig, cam, ice_cfg, opts):
     sink = None
     if opts["rtsp_base"]:
         sink = FfmpegSink(name, rtsp_url=f"{opts['rtsp_base'].rstrip('/')}/{name}",
-                          fps=opts["rtsp_fps"])
+                          fps=opts["rtsp_fps"], audio=opts["rtsp_audio"])
 
     recorder = None
     if opts["record_dir"]:
@@ -99,7 +100,6 @@ async def run_camera(sig, cam, ice_cfg, opts):
         the real restart time, so the timeline re-anchors instead of pretending
         an hours-long outage was a frozen picture.
         """
-        loop = asyncio.get_running_loop()
         next_tick = time.time()
         last_index = 0.0
         while True:
@@ -133,10 +133,25 @@ async def run_camera(sig, cam, ice_cfg, opts):
 
     try:
         while True:
-            stream = CameraStream(sig, did, ice_cfg, name=name)
+            stream = CameraStream(sig, did, ice_cfg, name=name,
+                                  want_audio=opts["rtsp_audio"] and sink is not None)
+            audio_task = None
             try:
                 track = await stream.connect()
                 log.info("[%s] connected, receiving video", name)
+
+                # Audio is only for the live RTSP feed: the recordings stay
+                # video-only for now, because the recorder paces frames on the
+                # wall clock and repeats the last one through a stall -- sound
+                # has no equivalent of a held frame, so muxing it in means
+                # generating silence for those gaps and keeping it aligned
+                # across reconnects. That is its own piece of work.
+                if stream.audio_track is not None:
+                    async def drain_audio(atrack):
+                        while True:
+                            sink.write_audio(await atrack.recv())
+                    audio_task = asyncio.ensure_future(drain_audio(stream.audio_track))
+
                 last_snap = 0.0
                 while True:
                     frame = await asyncio.wait_for(track.recv(), timeout=20)
@@ -144,7 +159,7 @@ async def run_camera(sig, cam, ice_cfg, opts):
                     latest["frame"], latest["at"] = frame, now
 
                     if sink:
-                        sink.write(frame)
+                        sink.write(frame)   # queues and returns; never blocks
 
                     # now.png for Home Assistant (+ timestamped PNGs if SNAPSHOT_KEEP=1)
                     if path and opts["snap_interval"] and now - last_snap >= opts["snap_interval"]:
@@ -159,6 +174,8 @@ async def run_camera(sig, cam, ice_cfg, opts):
             except Exception as ex:
                 log.warning("[%s] session dropped (%s), retrying in 10s", name, ex)
             finally:
+                if audio_task:
+                    audio_task.cancel()
                 # the recorder's ffmpeg stays alive across reconnects; the
                 # pacer keeps the timeline moving while we get back on
                 await stream.close()
@@ -211,6 +228,8 @@ async def main():
         "snap_keep": env("SNAPSHOT_KEEP", "0") == "1",          # keep timestamped PNGs too
         "rtsp_base": env("RTSP_BASE"),                          # e.g. rtsp://mediamtx:8554
         "rtsp_fps": int(env("RTSP_FPS", "15")),
+        # pull the camera's microphone too and publish it alongside the video
+        "rtsp_audio": env("RTSP_AUDIO", "0") == "1",
         "record_dir": env("RECORD_DIR"),                        # e.g. /rec -> continuous mp4
         "segment_seconds": int(env("SEGMENT_SECONDS", "600")),
         "record_fps": int(env("RECORD_FPS", "12")),

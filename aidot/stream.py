@@ -12,9 +12,12 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import subprocess
+import threading
 import time
 
+import av
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.sdp import candidate_from_sdp
 
@@ -69,13 +72,15 @@ def ice_server_list_for_device(ice_cfg, device_id):
 class CameraStream:
     """Negotiates one WebRTC session and exposes the incoming video track."""
 
-    def __init__(self, sig, device_id, ice_cfg, name=None):
+    def __init__(self, sig, device_id, ice_cfg, name=None, want_audio=False):
         self.sig = sig
         self.device_id = device_id
         self.name = name or device_id[:8]
         self.ice_cfg = ice_cfg
+        self.want_audio = want_audio
         self.pc = None
         self.track = None
+        self.audio_track = None
         self._track_ready = asyncio.Event()
 
     async def connect(self, timeout=30):
@@ -91,14 +96,25 @@ class CameraStream:
             if track.kind == "video":
                 self.track = track
                 self._track_ready.set()
+            elif track.kind == "audio":
+                self.audio_track = track
 
         @self.pc.on("connectionstatechange")
         async def on_state():
             log.info("[%s] connection state: %s", self.name, self.pc.connectionState)
 
-        # video only, receive-only. Requesting audio too makes some cameras
-        # answer with mismatched m-lines ("Media sections in answer do not
-        # match offer"); we don't use the audio track anyway.
+        # Audio is asked for as sendrecv even though we never send: the camera
+        # has a speaker for two-way talk, and its firmware treats a viewer that
+        # cannot be spoken to as not really there -- offered `recvonly` it
+        # hangs up a few seconds in. Offered sendrecv with no sender attached
+        # it stays up (measured: 97s and counting, against a teardown at ~22s).
+        #
+        # Probed against this camera (LK.IPC.A000088) rather than assumed: a
+        # two-section offer comes back as two clean sections, PCMA/8000
+        # sendrecv plus H264 sendonly. The "Media sections in answer do not
+        # match offer" this replaces came from a different offer shape.
+        if self.want_audio:
+            self.pc.addTransceiver("audio", direction="sendrecv")
         self.pc.addTransceiver("video", direction="recvonly")
 
         offer = await self.pc.createOffer()
@@ -161,7 +177,9 @@ class _FfmpegPipe:
         try:
             self.proc.stdin.write(frame.to_ndarray(format="yuv420p").tobytes())
         except (BrokenPipeError, ValueError, AttributeError):
-            log.warning("[%s] ffmpeg died, restarting on next frame", self.name)
+            rc = self.proc.poll() if self.proc else None
+            log.warning("[%s] ffmpeg died (rc=%s), restarting on next frame",
+                        self.name, rc)
             self.proc = None
 
     def close(self):
@@ -175,17 +193,251 @@ class _FfmpegPipe:
 
 
 class FfmpegSink(_FfmpegPipe):
-    """Re-encode the frames and push them to an RTSP endpoint."""
+    """Re-encode the frames and push them to an RTSP endpoint.
 
-    def __init__(self, name, rtsp_url, fps=15):
+    With `audio=True` the process takes a second input: the camera's G.711
+    audio, which aiortc hands us already decoded to 8 kHz mono PCM. It goes in
+    over its own pipe and back out as pcm_alaw, so mediamtx can serve it to a
+    browser over WebRTC without transcoding -- G711 is one of the codecs
+    WebRTC carries natively.
+
+    Writes never block the caller. Each pipe has a short queue and a thread of
+    its own, and a full queue drops the frame rather than waiting. That is not
+    a nicety: a 720p frame is 1.4MB against a 64KB pipe, so whenever ffmpeg
+    stalls -- and publishing to RTSP it does, whenever mediamtx is slow or has
+    dropped the session -- a direct write blocks until it recovers. Doing that
+    on the event loop froze every camera at once; doing it in a shared thread
+    pool exhausted the pool and froze them anyway, recorder included. For a
+    live view dropping frames is the right answer; the recording is fed from a
+    separate path that never drops.
+
+    The two pipes get separate threads on purpose, and the audio one writes on
+    a clock rather than on demand. ffmpeg reads its inputs in turn and blocks
+    on whichever pipe is empty -- so the moment the camera's audio stops (and
+    on a flaky link it stops often) ffmpeg stops reading video too, sends
+    nothing, and mediamtx drops the publisher for read timeout ten seconds
+    later. Writing silence through the gaps keeps it fed. It also means the
+    audio track carries exactly 8000 samples per second of wall clock, which
+    is what keeps it lined up with the video, whose frames are stamped with
+    their arrival time.
+    """
+
+    def __init__(self, name, rtsp_url, fps=15, audio=False, audio_rate=8000):
         super().__init__(name, fps)
         self.rtsp_url = rtsp_url
+        self.audio = audio
+        self.audio_rate = audio_rate
+        self._apipe = None      # our end of the audio pipe
+        self._resampler = None
+        # a couple of frames of slack, no more: a live view wants the newest
+        # picture, and a deep queue just adds latency before it drops anyway
+        self._vq = queue.Queue(maxsize=3)
+        self._aq = queue.Queue(maxsize=64)
+        self._pumps = []
 
     def _args(self, w, h):
-        log.info("[%s] rtsp -> %s (%dx%d)", self.name, self.rtsp_url, w, h)
-        return ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-g", str(self.fps * 2), "-pix_fmt", "yuv420p",
-                "-f", "rtsp", "-rtsp_transport", "tcp", self.rtsp_url]
+        log.info("[%s] rtsp -> %s (%dx%d%s)", self.name, self.rtsp_url, w, h,
+                 ", con audio" if self.audio else "")
+        args = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-g", str(self.fps * 2), "-pix_fmt", "yuv420p"]
+        if self.audio:
+            args += [
+                "-c:a", "pcm_alaw", "-ar", str(self.audio_rate), "-ac", "1",
+                # and never hold video back waiting for audio to catch up: the
+                # default interleaving window is a second, and stalling that
+                # long on a live feed makes mediamtx drop the publisher for
+                # read timeout.
+                "-max_interleave_delta", "0",
+            ]
+        return args + ["-f", "rtsp", "-rtsp_transport", "tcp", self.rtsp_url]
+
+    def _start(self, w, h):
+        self._stop_pumps()
+        # fresh queues, not the old ones: _stop_pumps drops a sentinel in to
+        # wake a blocked pump, and if that pump had already died with ffmpeg
+        # the sentinel just sits there -- for the *next* pump to read and exit
+        # on immediately. ffmpeg then waits forever for a first frame it will
+        # never get, alive but never opening its output.
+        self._vq = queue.Queue(maxsize=3)
+        self._aq = queue.Queue(maxsize=64)
+        if not self.audio:
+            super()._start(w, h)
+        else:
+            rfd, wfd = os.pipe()
+            try:
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+                       "-use_wallclock_as_timestamps", "1",
+                       "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
+                       "-r", str(self.fps), "-i", "pipe:0",
+                       "-f", "s16le", "-ar", str(self.audio_rate), "-ac", "1",
+                       # ffmpeg's pipe: protocol takes any descriptor number, so
+                       # the inherited one can be named directly -- no dup2
+                       # dance, and no FIFO left on the filesystem
+                       "-i", f"pipe:{rfd}"] + self._args(w, h)
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                             pass_fds=(rfd,))
+                self._apipe = os.fdopen(wfd, "wb", buffering=0)
+                wfd = None
+            finally:
+                os.close(rfd)
+                if wfd is not None:
+                    os.close(wfd)
+        self._spawn_video_pump()
+        if self.audio:
+            self._spawn_audio_pump()
+
+    def _spawn_video_pump(self):
+        """Write a frame every 1/fps, repeating the last one when the camera
+        has gone quiet.
+
+        Same reason the audio pipe is filled with silence: ffmpeg blocks on
+        whichever input has nothing to read. A camera reconnect takes upwards
+        of ten seconds, and through all of it a demand-driven pump would write
+        nothing, ffmpeg would send nothing, and mediamtx would drop the
+        publisher for read timeout -- which is exactly what it had been doing,
+        111 times in 75 minutes, long before audio entered the picture. A held
+        frame costs almost nothing to encode and keeps the session alive.
+        """
+        proc, stdin = self.proc, self.proc.stdin
+        period = 1.0 / self.fps
+
+        def pump():
+            last = None
+            nxt = time.time()
+            while True:
+                nxt += period
+                time.sleep(max(0.0, nxt - time.time()))
+                if time.time() - nxt > 1:      # fell behind; don't burst
+                    nxt = time.time()
+                while True:                    # take the newest, drop the rest
+                    try:
+                        chunk = self._vq.get_nowait()
+                    except queue.Empty:
+                        break
+                    if chunk is None:
+                        return
+                    last = chunk
+                if last is None:               # nothing has arrived yet
+                    continue
+                try:
+                    if proc.poll() is not None:
+                        return
+                    stdin.write(last)
+                except (BrokenPipeError, ValueError, AttributeError, OSError):
+                    log.warning("[%s] video pipe closed (ffmpeg rc=%s)",
+                                self.name, proc.poll())
+                    return
+
+        t = threading.Thread(target=pump, daemon=True, name=f"{self.name}-video")
+        t.start()
+        self._pumps.append((self._vq, t))
+
+    def _spawn_audio_pump(self):
+        """Write 8 kHz mono PCM to ffmpeg at exactly real-time rate, filling
+        with silence whenever the camera has not given us anything."""
+        proc, apipe = self.proc, self._apipe
+        period = 0.02
+        nbytes = int(self.audio_rate * 2 * period)   # s16 mono
+        silence = b"\x00" * nbytes
+        stop = object()
+
+        def pump():
+            buf = bytearray()
+            nxt = time.time()
+            while True:
+                nxt += period
+                time.sleep(max(0.0, nxt - time.time()))
+                if time.time() - nxt > 1:       # fell behind; don't burst
+                    nxt = time.time()
+                while True:
+                    try:
+                        chunk = self._aq.get_nowait()
+                    except queue.Empty:
+                        break
+                    if chunk is None:
+                        return
+                    buf += chunk
+                # keep at most a quarter second of backlog, so a burst does not
+                # turn into permanent delay behind the picture
+                if len(buf) > nbytes * 12:
+                    del buf[:len(buf) - nbytes * 12]
+                if len(buf) >= nbytes:
+                    chunk, buf = bytes(buf[:nbytes]), buf[nbytes:]
+                else:
+                    chunk = silence
+                try:
+                    if proc.poll() is not None:
+                        return
+                    apipe.write(chunk)
+                except (BrokenPipeError, ValueError, AttributeError, OSError):
+                    log.warning("[%s] audio pipe closed (ffmpeg rc=%s)",
+                                self.name, proc.poll())
+                    return
+
+        t = threading.Thread(target=pump, daemon=True, name=f"{self.name}-audio")
+        t.start()
+        self._pumps.append((self._aq, t))
+
+    def _stop_pumps(self):
+        for q, t in self._pumps:
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+        self._pumps = []
+
+    @staticmethod
+    def _offer(q, chunk):
+        """Enqueue, making room by discarding the oldest if we have to."""
+        try:
+            q.put_nowait(chunk)
+        except queue.Full:
+            try:
+                q.get_nowait()
+                q.put_nowait(chunk)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def write(self, frame):
+        if self.proc is None or self.proc.poll() is not None:
+            if self.proc is not None:
+                log.warning("[%s] ffmpeg died (rc=%s), restarting",
+                            self.name, self.proc.poll())
+            self._start(frame.width, frame.height)
+        self._offer(self._vq, frame.to_ndarray(format="yuv420p").tobytes())
+
+    def write_audio(self, frame):
+        """Feed one decoded audio frame. Dropped until the video side has
+        started the process -- it is the video that determines the geometry
+        ffmpeg needs, and a few lost milliseconds at startup cost nothing."""
+        if not self.audio or not self.is_open() or self._apipe is None:
+            return
+        if self._resampler is None:
+            self._resampler = av.AudioResampler(
+                format="s16", layout="mono", rate=self.audio_rate)
+        try:
+            for out in self._resampler.resample(frame):
+                self._offer(self._aq, bytes(out.planes[0]))
+        except Exception as ex:
+            # one bad frame is not a reason to tear anything down: closing the
+            # audio pipe sends EOF, and ffmpeg then ends the whole publish --
+            # cleanly, with no error message, which is a miserable thing to
+            # have to diagnose twice
+            log.warning("[%s] audio frame dropped: %s", self.name, ex)
+
+    def _close_audio(self):
+        if self._apipe is not None:
+            try:
+                self._apipe.close()
+            except Exception:
+                pass
+            self._apipe = None
+        self._resampler = None
+
+    def close(self):
+        self._stop_pumps()
+        self._close_audio()
+        super().close()
 
 
 class SegmentRecorder(_FfmpegPipe):
