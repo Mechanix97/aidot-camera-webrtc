@@ -238,8 +238,14 @@ class FfmpegSink(_FfmpegPipe):
     def _args(self, w, h):
         log.info("[%s] rtsp -> %s (%dx%d%s)", self.name, self.rtsp_url, w, h,
                  ", con audio" if self.audio else "")
+        # One keyframe a second, not one every two. A player joining a live
+        # stream shows nothing until the first keyframe, and audio starts
+        # immediately -- so a long GOP reads as the sound running ahead of the
+        # picture, even though the tracks themselves are in sync (measured in
+        # the browser: under 20ms of playout skew). At this bitrate the extra
+        # keyframes cost little.
         args = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-g", str(self.fps * 2), "-pix_fmt", "yuv420p"]
+                "-g", str(self.fps), "-pix_fmt", "yuv420p"]
         if self.audio:
             args += [
                 "-c:a", "pcm_alaw", "-ar", str(self.audio_rate), "-ac", "1",
@@ -265,8 +271,13 @@ class FfmpegSink(_FfmpegPipe):
         else:
             rfd, wfd = os.pipe()
             try:
+                # Neither input is stamped with arrival time. Both pumps write
+                # on the clock -- `fps` frames and `audio_rate` samples per
+                # second of wall clock, held frames and silence filling any
+                # gap -- so each demuxer's own nominal rate already *is* wall
+                # clock and both start at zero. Stamping one and not the other
+                # put them on different bases for no reason.
                 cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-                       "-use_wallclock_as_timestamps", "1",
                        "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}",
                        "-r", str(self.fps), "-i", "pipe:0",
                        "-f", "s16le", "-ar", str(self.audio_rate), "-ac", "1",
