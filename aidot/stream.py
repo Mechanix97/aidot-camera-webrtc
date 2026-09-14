@@ -350,7 +350,6 @@ class FfmpegSink(_FfmpegPipe):
         period = 0.02
         nbytes = int(self.audio_rate * 2 * period)   # s16 mono
         silence = b"\x00" * nbytes
-        stop = object()
 
         def pump():
             buf = bytearray()
@@ -390,7 +389,7 @@ class FfmpegSink(_FfmpegPipe):
         self._pumps.append((self._aq, t))
 
     def _stop_pumps(self):
-        for q, t in self._pumps:
+        for q, _thread in self._pumps:
             try:
                 q.put_nowait(None)
             except queue.Full:

@@ -22,12 +22,10 @@ logging.basicConfig(level="WARNING",
 
 def summarize(sdp, label):
     print(f"\n===== {label} =====")
-    mid = None
     for line in sdp.splitlines():
         if line.startswith("m="):
             print(f"  {line}")
         elif line.startswith("a=mid:"):
-            mid = line.split(":", 1)[1]
             print(f"      {line}   ")
         elif line.startswith(("a=sendrecv", "a=recvonly", "a=sendonly", "a=inactive")):
             print(f"      {line}")
@@ -65,7 +63,7 @@ async def try_offer(sig, api, device_id, shape):
     summarize(answer, f"RESPUESTA de la cámara ({shape})")
     try:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=answer, type="answer"))
-        print(f"  -> setRemoteDescription OK")
+        print("  -> setRemoteDescription OK")
     except Exception as ex:
         print(f"  -> setRemoteDescription FALLA: {ex}")
     await pc.close()
