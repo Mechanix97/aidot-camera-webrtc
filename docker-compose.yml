@@ -13,10 +13,16 @@ services:
     volumes:
       # now.png for Home Assistant's local_file camera
       - /home/lucas/home-assistant/data:/data
+      # Both trees live on the ext4 disk (/mnt/data), not the NTFS one the
+      # media stack uses. Measured on this host: 95 MB/s sequential against
+      # 49, and 200 small files in 0.08s against 0.72. Both matter here --
+      # continuous recording writes ~16 GB a day across the two trees, and
+      # the recorder rewrites a .session-*.json every 2s per camera. NTFS
+      # goes through ntfs-3g in userspace, which is what costs the rest.
       # rolling 10-min segments (RECORD_DIR=/rec), pruned after RETENTION_DAYS
-      - /mnt/hdd/aidot:/rec
+      - /mnt/data/aidot:/rec
       # one consolidated mp4 per camera per day (DAILY_DIR=/daily)
-      - /mnt/hdd/aidot-daily:/daily
+      - /mnt/data/aidot-daily:/daily
     restart: unless-stopped
 
   # Live view: aidot-webrtc re-publishes each camera to RTSP (RTSP_BASE in
