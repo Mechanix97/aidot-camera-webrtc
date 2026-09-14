@@ -194,5 +194,19 @@ Use these to re-discover the protocol if aiDot changes something.
   API update.
 * `aiortc` decodes H.264 to frames; recording and RTSP re-encode. Far cheaper
   than Chrome, but not a pure passthrough.
-* cam1 (weaker Wi-Fi) drops and reconnects periodically; the run loop recovers
-  after ~10s.
+* Sessions drop and are rebuilt constantly — measured at 270 times a day on
+  one camera, a median of 23 s each. That matches the firmware's own teardown
+  (see `CameraStream.connect`) rather than a fault on the link, so the run loop
+  treats a session that lasted `RETRY_GOOD_SECONDS` as a working one that
+  merely ended and dials straight back at `RETRY_MIN_SECONDS`; only a session
+  that failed early backs off, doubling up to `RETRY_MAX_SECONDS`. The gap from
+  drop to receiving again went from ~17 s to ~7.5 s, which is most of an hour a
+  day of held frame recovered. The teardown itself is still unexplained.
+* What is lost is visible, not silent: the reconnect log says how long the
+  session lasted and which exception ended it (`MediaStreamError` is the peer
+  hanging up, `TimeoutError` is 20 s with no frame on a connection that is
+  nominally still up — two very different faults that used to print the same
+  empty `session dropped ()`). Undecodable H.264 packets are counted and
+  reported once a minute instead of being silenced, and the recorder's pacer
+  says so when it falls behind, since that is recording time that no longer
+  matches the wall clock.

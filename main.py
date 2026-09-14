@@ -29,10 +29,29 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("aidot")
 
-# aiortc logs a warning for every H.264 packet it cannot decode while waiting
-# for the first keyframe (and on any packet loss). It is just noise -- the
-# snapshots/recordings come out fine on each keyframe.
-logging.getLogger("aiortc.codecs.h264").setLevel(logging.ERROR)
+
+class _CountingFilter(logging.Filter):
+    """Drop a noisy logger's records, but keep a tally of them."""
+
+    def __init__(self):
+        super().__init__()
+        self.n = 0
+
+    def filter(self, record):
+        self.n += 1
+        return False
+
+
+# aiortc logs a warning for every H.264 packet it cannot decode: a burst of
+# them after every reconnect while it waits for the first keyframe, and one
+# per loss after that. Printing each is unreadable, but silencing them outright
+# -- which is what this did -- threw away the only measurement of how lossy the
+# link actually is. Count them instead and report the rate once a minute, so a
+# steady trickle between reconnects is visible as what it is: dropped packets.
+h264_drops = _CountingFilter()
+_h264_log = logging.getLogger("aiortc.codecs.h264")
+_h264_log.setLevel(logging.WARNING)
+_h264_log.addFilter(h264_drops)
 logging.getLogger("aioice.ice").setLevel(logging.WARNING)
 
 TZ = timezone(timedelta(hours=-3))  # America/Argentina/Buenos_Aires
@@ -102,10 +121,27 @@ async def run_camera(sig, cam, ice_cfg, opts):
         """
         next_tick = time.time()
         last_index = 0.0
+        lost = 0.0
+        last_lost_log = time.time()
         while True:
             next_tick += rec_period
             await asyncio.sleep(max(0.0, next_tick - time.time()))
-            if time.time() - next_tick > 5:   # fell far behind; don't burst
+            behind = time.time() - next_tick
+            if behind > 5:   # fell far behind; don't burst
+                # Skipping ahead is right -- bursting a minute of backlog into
+                # ffmpeg would only make it worse -- but those seconds are
+                # gone: nothing was written for them, so the file now runs
+                # short of the wall-clock span it covers. That is exactly the
+                # drift this pacing exists to prevent, and it means the host
+                # could not keep up (decode + two encodes per camera is
+                # CPU-bound here). Absorbing it silently hid the one symptom
+                # that says so.
+                lost += behind
+                if time.time() - last_lost_log > 60:
+                    last_lost_log = time.time()
+                    log.warning("[%s] pacer fell behind by %.1fs (%.1fs of "
+                                "recording lost so far); host is not keeping up",
+                                name, behind, lost)
                 next_tick = time.time()
 
             if time.time() - last_index > 2:
@@ -131,13 +167,25 @@ async def run_camera(sig, cam, ice_cfg, opts):
 
     pacer_task = asyncio.ensure_future(pacer()) if recorder else None
 
+    # How long to wait before dialling back in. Flat 10s used to be the whole
+    # policy, and it is the wrong shape: this camera's firmware hangs up on its
+    # own after ~22s no matter what we do (see CameraStream.connect), so the
+    # common case is a session that worked, ended, and should be replaced
+    # *now*. Ten seconds of held frame, 270 times a day, was 45 minutes of
+    # frozen picture bought for nothing. So: a session that actually delivered
+    # is retried straight away, and only a session that failed early -- the
+    # camera is off, the LAN is gone, the broker is refusing -- backs off, so
+    # we still don't hammer the cloud when there is nothing to talk to.
+    retry = opts["retry_min"]
     try:
         while True:
             stream = CameraStream(sig, did, ice_cfg, name=name,
                                   want_audio=opts["rtsp_audio"] and sink is not None)
             audio_task = None
+            connected_at = None
             try:
                 track = await stream.connect()
+                connected_at = time.time()
                 log.info("[%s] connected, receiving video", name)
 
                 # Audio is only for the live RTSP feed: the recordings stay
@@ -172,19 +220,55 @@ async def run_camera(sig, cam, ice_cfg, opts):
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
-                log.warning("[%s] session dropped (%s), retrying in 10s", name, ex)
+                up = time.time() - connected_at if connected_at else 0.0
+                if up >= opts["retry_good_seconds"]:
+                    retry = opts["retry_min"]
+                else:
+                    retry = min(retry * 2, opts["retry_max"])
+                # aiortc's MediaStreamError and asyncio's TimeoutError both
+                # stringify to nothing, which is how this line spent a year
+                # reading "session dropped ()". The class name says which, and
+                # how long the session lasted says whether the camera hung up
+                # on us or we never got in. Keep the message when there is one:
+                # a negotiation ValueError carries the only description of what
+                # the camera answered that we disagreed with.
+                why = type(ex).__name__ + (f": {ex}" if str(ex) else "")
+                log.warning("[%s] session dropped after %.0fs (%s), retrying in %.0fs",
+                            name, up, why, retry)
             finally:
                 if audio_task:
                     audio_task.cancel()
                 # the recorder's ffmpeg stays alive across reconnects; the
                 # pacer keeps the timeline moving while we get back on
                 await stream.close()
-            await asyncio.sleep(10)
+            await asyncio.sleep(retry)
     finally:
         if pacer_task:
             pacer_task.cancel()
         if recorder:
             recorder.close()
+
+
+async def loss_loop(period=60):
+    """Report, once a minute, the packets aiortc could not decode.
+
+    Zero is the normal reading on a healthy link between reconnects. A steady
+    non-zero rate is packet loss on the path from the camera; a burst right
+    after a reconnect is just the decoder waiting for its first keyframe.
+
+    One number for all cameras: aiortc logs these from a module-level logger
+    with nothing on the record to say which session they came from, and
+    threading that through is not worth a private fork of its decoder. Which
+    camera is losing is the reconnect log's job.
+    """
+    last = h264_drops.n
+    while True:
+        await asyncio.sleep(period)
+        n, last = h264_drops.n - last, h264_drops.n
+        if n:
+            log.info("undecodable H.264 packets across all cameras in the last %ds: %d "
+                     "(post-reconnect bursts are expected; a steady rate is loss)",
+                     period, n)
 
 
 async def retention_loop(record_dir, retention_days):
@@ -240,6 +324,13 @@ async def main():
         # camera -> us pipeline delay, subtracted from the timeline anchor.
         # 0 unless you measure a steady lag; see SegmentRecorder.
         "capture_latency": float(env("CAPTURE_LATENCY_SECONDS", "0")),
+        # reconnect backoff; see run_camera. A session that stayed up at least
+        # `retry_good_seconds` is treated as a working one that merely ended,
+        # and is replaced at `retry_min`; anything shorter doubles the wait up
+        # to `retry_max`.
+        "retry_min": float(env("RETRY_MIN_SECONDS", "1")),
+        "retry_max": float(env("RETRY_MAX_SECONDS", "30")),
+        "retry_good_seconds": float(env("RETRY_GOOD_SECONDS", "15")),
     }
     retention_days = int(env("RETENTION_DAYS", "3"))          # segment retention
     daily_dir = env("DAILY_DIR")                             # set -> nightly one-file-per-day
@@ -266,6 +357,7 @@ async def main():
     log.info("MQTT connected")
 
     tasks = [asyncio.ensure_future(run_camera(sig, c, ice_cfg, opts)) for c in cams]
+    tasks.append(asyncio.ensure_future(loss_loop()))
     if opts["record_dir"]:
         tasks.append(asyncio.ensure_future(
             retention_loop(opts["record_dir"], retention_days)))
