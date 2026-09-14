@@ -194,14 +194,18 @@ Use these to re-discover the protocol if aiDot changes something.
   API update.
 * `aiortc` decodes H.264 to frames; recording and RTSP re-encode. Far cheaper
   than Chrome, but not a pure passthrough.
-* Sessions drop and are rebuilt constantly — measured at 270 times a day on
-  one camera, a median of 23 s each. That matches the firmware's own teardown
-  (see `CameraStream.connect`) rather than a fault on the link, so the run loop
-  treats a session that lasted `RETRY_GOOD_SECONDS` as a working one that
-  merely ended and dials straight back at `RETRY_MIN_SECONDS`; only a session
-  that failed early backs off, doubling up to `RETRY_MAX_SECONDS`. The gap from
-  drop to receiving again went from ~17 s to ~7.5 s, which is most of an hour a
-  day of held frame recovered. The teardown itself is still unexplained.
+* Sessions end and are rebuilt on their own, and they do it **in bursts**: the
+  same camera was measured at 270 drops in a day (a median of 23 s per session)
+  and, on a quiet half hour with nothing restarting, at one drop in thirty
+  minutes. The bursts track session churn — ours, across a restart — more
+  closely than anything on the link, which is worth knowing before reading a
+  bad ten minutes as a fault. Why a camera enters that state is still open.
+* Because a session that ended after working is not a fault, the run loop dials
+  straight back at `RETRY_MIN_SECONDS` when it lasted at least
+  `RETRY_GOOD_SECONDS`; only one that failed early backs off, doubling up to
+  `RETRY_MAX_SECONDS`. Measured A/B, 12 minutes an arm: the drop rate did not
+  move (0.92 vs 1.08/min) and the gap from drop to receiving again halved,
+  17 s to 8 s.
 * What is lost is visible, not silent: the reconnect log says how long the
   session lasted and which exception ended it (`MediaStreamError` is the peer
   hanging up, `TimeoutError` is 20 s with no frame on a connection that is

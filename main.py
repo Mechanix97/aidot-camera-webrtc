@@ -168,14 +168,21 @@ async def run_camera(sig, cam, ice_cfg, opts):
     pacer_task = asyncio.ensure_future(pacer()) if recorder else None
 
     # How long to wait before dialling back in. Flat 10s used to be the whole
-    # policy, and it is the wrong shape: this camera's firmware hangs up on its
-    # own after ~22s no matter what we do (see CameraStream.connect), so the
-    # common case is a session that worked, ended, and should be replaced
-    # *now*. Ten seconds of held frame, 270 times a day, was 45 minutes of
-    # frozen picture bought for nothing. So: a session that actually delivered
-    # is retried straight away, and only a session that failed early -- the
-    # camera is off, the LAN is gone, the broker is refusing -- backs off, so
-    # we still don't hammer the cloud when there is nothing to talk to.
+    # policy, and it is the wrong shape whenever a session ends after having
+    # worked: there is nothing to back away from, and the pacer is holding a
+    # frozen frame for every second we wait. Measured A/B, 12 minutes an arm:
+    # dropping the wait from 10s to 1s left the drop rate alone (0.92 vs
+    # 1.08/min) and halved the gap from drop to receiving again, 17s to 8s.
+    #
+    # A session that failed *early* is the opposite case -- the camera is off,
+    # the LAN is gone, the broker is refusing -- so that one doubles its wait
+    # up to retry_max instead, and we don't hammer the cloud over nothing.
+    #
+    # Note this is deliberately not a claim about why sessions end. They come
+    # in bursts: a camera can hold one session for half an hour and then drop
+    # eleven times in twelve minutes, and the bursts follow session churn
+    # (ours, on restart) more than anything on the link. Whatever provokes
+    # them, the recovery cost is what this controls.
     retry = opts["retry_min"]
     try:
         while True:
